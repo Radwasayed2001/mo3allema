@@ -13,6 +13,7 @@ const LoginPage = () => {
     setFormError(null);
     try {
       await login(email, password);
+      window.location.reload();
     } catch (err) {
       setFormError(err.message || "حدث خطأ أثناء تسجيل الدخول");
     }
