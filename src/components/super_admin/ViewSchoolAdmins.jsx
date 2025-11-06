@@ -1,98 +1,90 @@
-import React, { useEffect, useState } from "react"; // <-- (التعديل 1: إضافة useState)
-// --- (تم تعديل Imports) ---
-import { collection, deleteDoc, doc, where, query, onSnapshot } from "firebase/firestore";
+// src/components/super_admin/ViewSchoolAdmins.jsx
+import React, { useEffect, useState } from "react";
+import {
+  collection,
+  deleteDoc,
+  doc,
+  where,
+  query,
+  onSnapshot,
+  getDocs
+} from "firebase/firestore";
 import { db } from "../../lib/firebaseConfig";
-import toast from 'react-hot-toast'; // <-- استيراد react-hot-toast
-import { Button } from "@/components/ui/button"; // (لاستخدامها في الـ Toast)
-import { Loader2, Trash2, AlertTriangle, ShieldOff } from "lucide-react"; // (أيقونات)
+import toast from "react-hot-toast";
+import { Button } from "@/components/ui/button";
+import { Loader2, Trash2, AlertTriangle } from "lucide-react";
 
 const ViewSchoolAdmins = () => {
   const [admins, setAdmins] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [schoolsMap, setSchoolsMap] = useState({}); // { schoolId: schoolName }
 
+  // fetch admins realtime
   useEffect(() => {
     setLoading(true);
     const q = query(collection(db, "users"), where("role", "==", "school_admin"));
-    const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      setAdmins(querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-      setLoading(false);
-    }, (error) => {
-      console.error("Error fetching admins: ", error);
-      toast.error("فشل جلب قائمة المدراء");
-      setLoading(false);
-    });
+    const unsubscribe = onSnapshot(
+      q,
+      (querySnapshot) => {
+        setAdmins(querySnapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setLoading(false);
+      },
+      (error) => {
+        console.error("Error fetching admins: ", error);
+        toast.error("فشل جلب قائمة المدراء");
+        setLoading(false);
+      }
+    );
 
     return () => unsubscribe();
   }, []);
 
-  // --- (دالة الحذف الفعلية - تحذف صلاحيات Firestore فقط) ---
+  // fetch schools once and build map
+  useEffect(() => {
+    const loadSchools = async () => {
+      try {
+        const snap = await getDocs(collection(db, "schools"));
+        const map = {};
+        snap.forEach((d) => {
+          const data = d.data() || {};
+          map[d.id] = data.name || d.id;
+        });
+        setSchoolsMap(map);
+      } catch (err) {
+        console.error("Failed to load schools:", err);
+        toast.error("فشل جلب بيانات المدارس");
+      }
+    };
+    loadSchools();
+  }, []);
+
   const handleDelete = async (adminId) => {
     try {
       await deleteDoc(doc(db, "users", adminId));
       toast.success("تم حذف صلاحيات المدير بنجاح!");
     } catch (e) {
-      toast.error("فشل الحذف: " + e.message);
+      console.error("delete admin error:", e);
+      toast.error("فشل الحذف: " + (e.message || ""));
     }
   };
 
-  // --- (دالة فتح مربع الحوار مع نص تحذير مُعدل) ---
+  // Simple confirm (safe) before delete
   const promptDelete = (admin) => {
-    toast((t) => {
-      // --- (التعديل 2: إضافة حالة تحميل داخل الـ Toast) ---
-      const [isDeleting, setIsDeleting] = useState(false);
-
-      return (
-        <div className="flex flex-col gap-4 p-4" dir="rtl">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="h-6 w-6 text-red-500" />
-            <h3 className="font-bold">هل أنت متأكد من الحذف؟</h3>
-          </div>
-          <p className="text-sm text-slate-600">
-            سيتم حذف صلاحيات المدير "{admin.email}" نهائيًا من قاعدة البيانات.
-          </p>
-          
-
-          <div className="flex gap-2 justify-end">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => toast.dismiss(t.id)}
-              disabled={isDeleting} // <-- تعطيل عند التحميل
-            >
-              إلغاء
-            </Button>
-            <Button
-              variant="destructive"
-              size="sm"
-              disabled={isDeleting} // <-- تعطيل عند التحميل
-              onClick={async () => { // <-- (التعديل 3: تحويله إلى async)
-                setIsDeleting(true); // <-- تفعيل التحميل
-                
-                await handleDelete(admin.id); // <-- انتظار اكتمال الحذف
-                
-                toast.dismiss(t.id); // <-- إغلاق الـ Toast بعد الانتهاء
-              }}
-            >
-              {/* --- (التعديل 4: إظهار Spinner) --- */}
-              {isDeleting ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                "نعم، قم بحذف الصلاحيات"
-              )}
-            </Button>
-          </div>
-        </div>
-      );
-    }, {
-      duration: Infinity, 
-      style: {
-        background: 'white',
-        borderRadius: '0.5rem',
-        boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
-        border: '1px solid #e2e8f0',
-      },
-      position: 'top-center',
-    });
+    const schoolName = schoolsMap[admin.schoolId] || admin.schoolId || "اسم غير معروف";
+    const ok = window.confirm(
+      `هل أنت متأكد من حذف صلاحيات المدير "${admin.email}" المرتبط بمدرسة "${schoolName}"؟\n\nسيتم حذف صلاحياته نهائيًا من قاعدة البيانات.`
+    );
+    if (ok) {
+      // optionally show a small toast while deleting
+      const tId = toast.loading("جاري الحذف...");
+      handleDelete(admin.id)
+        .then(() => {
+          toast.dismiss(tId);
+        })
+        .catch(() => {
+          toast.dismiss(tId);
+        });
+    }
   };
 
   if (loading) {
@@ -113,25 +105,28 @@ const ViewSchoolAdmins = () => {
             <thead className="bg-slate-50">
               <tr>
                 <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">البريد الإلكتروني</th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">معرّف المدرسة</th>
+                <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">اسم المدرسة</th>
                 <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">إجراءات</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-slate-200">
               {admins.length === 0 ? (
                 <tr><td colSpan={3} className="p-6 text-slate-400 text-center">لا يوجد مدراء بعد</td></tr>
-              ) : admins.map((admin) => (
-                <tr key={admin.id}>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-900">{admin.email}</td>
-                  <td className="px-6 py-4 whitespace-nowrap text-xs text-slate-500">{admin.schoolId}</td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                    <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-900" onClick={() => promptDelete(admin)}>
-                      <Trash2 className="h-4 w-4 ml-1" />
-                      حذف
-                    </Button>
-                  </td>
-                </tr>
-              ))}
+              ) : admins.map((admin) => {
+                const schoolName = schoolsMap[admin.schoolId] || admin.schoolId || "-";
+                return (
+                  <tr key={admin.id}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-900">{admin.email}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-xs text-slate-700">{schoolName}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                      <Button variant="ghost" size="sm" className="text-red-600 hover:text-red-900" onClick={() => promptDelete(admin)}>
+                        <Trash2 className="h-4 w-4 ml-1" />
+                        حذف
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

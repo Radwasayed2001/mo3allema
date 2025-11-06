@@ -59,7 +59,7 @@ const Header = ({
         where("teacherId", "==", teacherId), // <-- الفلتر الجديد
         orderBy('childName')
       );
-      
+
       const unsubscribe = onSnapshot(q, (snapshot) => {
         const items = snapshot.docs.map(doc => {
           const data = doc.data();
@@ -116,9 +116,7 @@ const Header = ({
   };
 
   const handleSettings = () => {
-    toast({
-      title: "🚧 هذه الميزة غير مُفعّلة بعد—لكن لا تقلق! يمكنك طلبها في رسالتك التالية! 🚀"
-    });
+    return <Settings />
   };
 
   return (

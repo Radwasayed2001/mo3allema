@@ -1,6 +1,7 @@
 // src/components/EducationalPlan.jsx
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import siteLogo from '../../public/site-logo.png'
 import {
   BookOpen,
   Zap,
@@ -255,7 +256,7 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       toast({ title: 'لا توجد خطة للحفظ', description: 'توليد الخطة أولاً قبل الحفظ.', className: 'notification-warning' });
       return null;
     }
-    
+
     // --- (التحقق من Props) ---
     if (!userSchoolId || !teacherId) {
       toast({
@@ -403,42 +404,66 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       return;
     }
 
-    const buttons = document.querySelectorAll('button');
-    buttons.forEach(btn => btn.style.display = 'none');
-    document.querySelectorAll('li').forEach(li => li.style.listStyle = 'none');
+    // إخفاء الأزرار فقط داخل الـ planRef (بدلاً من إخفاء كل أزرار الصفحة)
+    const root = planRef.current;
+    if (!root) return;
+    const btns = root.querySelectorAll('button, a');
+    btns.forEach(b => b.style.display = 'none');
 
     const oldDir = document.body.dir;
-    document.body.dir = 'rtl';
+    document.body.dir = 'rtl'; // للتأكد أن html2canvas يلتقط RTL بشكل سليم
 
     try {
-      const canvas = await html2canvas(planRef.current, {
-        scale: 2,
+      // إعدادات html2canvas محسّنة: scale أعلى لدقة أفضل، background أبيض
+      const canvas = await html2canvas(root, {
+        scale: 3,
         useCORS: true,
+        allowTaint: false,
+        backgroundColor: '#ffffff',
         logging: false,
-        windowWidth: document.documentElement.clientWidth
+        windowWidth: Math.max(document.documentElement.clientWidth, root.scrollWidth),
+        scrollY: -window.scrollY // لتجنب تأثير الـ viewport عند الاسكرول
       });
 
       const imgData = canvas.toDataURL('image/png');
+
       const pdf = new jsPDF('p', 'mm', 'a4');
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = pdf.internal.pageSize.getHeight();
 
-      const imgProps = { width: canvas.width, height: canvas.height };
+      // حساب أبعاد الصورة داخل صفحات الـ PDF (mm)
+      const imgProps = pdf.getImageProperties(imgData);
       const imgRatio = imgProps.height / imgProps.width;
-      let imgWidthInPdf = pdfWidth;
-      let imgHeightInPdf = pdfWidth * imgRatio;
+      const imgWidthInPdf = pdfWidth;
+      const imgHeightInPdf = pdfWidth * imgRatio;
 
-      if (imgHeightInPdf > pdfHeight) {
-        const scale = pdfHeight / imgHeightInPdf;
-        imgWidthInPdf *= scale;
-        imgHeightInPdf *= scale;
+      // إضافة الصورة الصفحة الأولى ثم قطع للصفحات التالية إن طالت المحتوى
+      let heightLeft = imgHeightInPdf;
+      let position = 0;
+      pdf.addImage(imgData, 'PNG', 0, position, imgWidthInPdf, imgHeightInPdf);
+      heightLeft -= pdfHeight;
+
+      while (heightLeft > -0.1) { // حلقة لإضافة صفحات إضافية
+        position = heightLeft - imgHeightInPdf;
+        pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, position, imgWidthInPdf, imgHeightInPdf);
+        heightLeft -= pdfHeight;
       }
 
-      const x = (pdfWidth - imgWidthInPdf) / 2;
-      const y = (pdfHeight - imgHeightInPdf) / 2;
+      // الآن نضيف footer / header (رقم الصفحة ومعلومات الختم) على كل صفحة
+      const pageCount = pdf.internal.getNumberOfPages();
+      for (let i = 1; i <= pageCount; i++) {
+        pdf.setPage(i);
+        // footer: اسم النظام في اليسار (بـ mm)
+        pdf.setFontSize(9);
+        pdf.setTextColor(100);
+        // فقط رقم الصفحة بالإنجليزية (آمن)
+        pdf.setFontSize(9);
+        pdf.setTextColor(100);
+        pdf.text(`Page ${i} / ${pageCount}`, pdfWidth / 2, pdfHeight - 8, { align: 'center' });
+      }
 
-      pdf.addImage(imgData, 'PNG', x, y, imgWidthInPdf, imgHeightInPdf);
-      const filename = `plan_${formData.childName || 'child'}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`;
+      const filename = `plan_${(formData.childName || 'child').replace(/\s+/g, '_')}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`;
       pdf.save(filename);
 
       toast({ title: 'تم تنزيل الـ PDF', description: `تم حفظ الخطة كملف: ${filename}`, className: 'notification-success', duration: 6000 });
@@ -446,10 +471,11 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       console.error('export PDF error', err);
       toast({ title: 'فشل إنشاء الـ PDF', description: 'حاول مرة أخرى أو اطلعي الكونسول للمزيد من التفاصيل.', className: 'notification-error' });
     } finally {
-      document.body.dir = oldDir; 
-      buttons.forEach(btn => btn.style.display = '');
+      document.body.dir = oldDir;
+      btns.forEach(b => b.style.display = '');
     }
   };
+
 
 
 
@@ -566,6 +592,15 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
               // attach ref here so html2canvas captures exactly ما تريديه
               return (
                 <motion.div key="plan" ref={planRef} dir="rtl" style={{ textAlign: 'right' }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-4 text-sm bg-white p-4 rounded">
+                  <div className="pdf-header flex items-center justify-between mb-4">
+                    {/* ضعّي الشعار في public/images/logo.png */}
+                    <img src={siteLogo} alt="تِبيان" style={{ height: 56, objectFit: 'contain' }} />
+                    <div style={{ textAlign: 'right' }}>
+                      <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>نظام تِبيان</h2>
+                      <div style={{ fontSize: 12 }}>{formData.childName || currentChild || 'اسم الطفل: غير محدد'}</div>
+                      <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date().toLocaleDateString('ar-EG')}</div>
+                    </div>
+                  </div>
                   <PlanSection title="الهدف الذكي (SMART)" content={norm.smart_goal || '-'} />
                   <PlanSection title="الاستراتيجية التعليمية" icon={BrainCircuit} content={norm.teaching_strategy || '-'} />
                   <PlanSection title="تحليل المهمة" content={<ul className="list-disc pr-4">{(norm.task_analysis_steps || []).map((s, i) => <li dir="rtl" key={i}>{s}</li>)}</ul>} />

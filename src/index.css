@@ -522,3 +522,33 @@ body {
     box-shadow: 0 0 0 10px rgba(34, 197, 94, 0);
   }
 }
+
+/* styles.css أو داخل ملف Tailwind حسب إعدادك */
+.pdf-export {
+  font-family: "Noto Naskh Arabic", "Segoe UI", Tahoma, sans-serif;
+  color: #0f172a;
+  /* slate-900 */
+  line-height: 1.5;
+  font-size: 13px;
+}
+
+.pdf-header img {
+  max-height: 56px;
+}
+
+.plan-section h4 {
+  color: #047857;
+  /* أخضر تِبيان */
+}
+
+.plan-section .content {
+  background: #fff;
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid #e6e9ef;
+}
+
+/* إزالة الظلال عند الطباعة (html2canvas يأخذ ما في DOM، فحطي هذه لوحش الظلال) */
+.pdf-export * {
+  box-shadow: none !important;
+}
