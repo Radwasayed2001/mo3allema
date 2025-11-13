@@ -1,10 +1,10 @@
 import { initializeApp, getApp, getApps } from 'firebase/app';
 // --- (تم تعديل Imports لإضافة signInWithEmailAndPassword) ---
-import { 
-  getAuth, 
-  createUserWithEmailAndPassword, 
+import {
+  getAuth,
+  createUserWithEmailAndPassword,
   signInWithEmailAndPassword, // <-- لاسترجاع الـ UID
-  signOut 
+  signOut
 } from 'firebase/auth';
 import { db } from './firebaseConfig';
 // --- (تم تعديل Imports لإضافة getDoc و setDoc) ---
@@ -42,7 +42,7 @@ export const createUserAsAdmin = async (email, password, userData) => {
     await setDoc(userDocRef, {
       uid: newUid,
       email: email,
-      ...userData 
+      ...userData
     });
 
     await signOut(secondaryAuth);
@@ -55,14 +55,14 @@ export const createUserAsAdmin = async (email, password, userData) => {
         // (نحاول تسجيل الدخول للحصول على UID)
         const signInCredential = await signInWithEmailAndPassword(secondaryAuth, email, password);
         newUid = signInCredential.user.uid;
-        
+
         // (الآن لدينا UID، نقوم بإنشاء/تحديث مستند الصلاحيات)
         const userDocRef = doc(db, 'users', newUid);
-        
+
         await setDoc(userDocRef, {
           uid: newUid,
           email: email,
-          ...userData 
+          ...userData
         }, { merge: true }); // (استخدام merge لضمان عدم مسح بيانات قديمة)
 
         await signOut(secondaryAuth);
@@ -76,7 +76,7 @@ export const createUserAsAdmin = async (email, password, userData) => {
         return { success: false, error: "هذا البريد مستخدم، وكلمة المرور المدخلة خاطئة." };
       }
     }
-    
+
     // (خطأ آخر غير "البريد مستخدم"، مثل باسورد ضعيف)
     console.error("Create user failed:", createError);
     return { success: false, error: createError.message };

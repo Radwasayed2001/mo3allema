@@ -25,28 +25,17 @@ import html2canvas from 'html2canvas';
 
 /**
  * SessionLog
+ * Props:
  * - data: array of session/notes objects
- *   expected shape (example):
- *   {
- *     id,
- *     child,
- *     activity,
- *     text,
- *     timestamp, // ISO or number
- *     status, // draft | pending | applied
- *     tags: [],
- *     energy: 3,
- *     hasAudio: false,
- *     audioUrl: '',
- *     suggestions: [],
- *     customizations: [],
- *     sessionDuration: 12, // in minutes (optional)
- *     generatedPlan: { normalized: { smart_goal, activities, ... }, ... } // optional
- *     meta: { source, savedAt, ... } // optional
- *   }
+ * - onUpdateData(updatedArray)
+ * - onReloadSessions()
+ * - isLoadingSessions (bool)
+ * - onOpenSession(session, opts)  <-- NEW optional callback
+ *
+ * Expected session shape (example): see original file comments.
  */
 
-const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessions }) => {
+const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessions, onOpenSession }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedChild, setSelectedChild] = useState('');
   const [selectedActivity, setSelectedActivity] = useState('');
@@ -87,15 +76,32 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
     return `${h} س ${m} د`;
   };
 
-  const getStatusBadge = (status) => {
-    const statusConfig = {
-      applied: { label: 'مُطبّق', className: 'inline-block px-2 py-0.5 rounded text-xs bg-green-100 text-green-800' },
-      pending: { label: 'قيد المتابعة', className: 'inline-block px-2 py-0.5 rounded text-xs bg-yellow-100 text-yellow-800' },
-      draft: { label: 'مسودة', className: 'inline-block px-2 py-0.5 rounded text-xs bg-slate-100 text-slate-700' }
-    };
-    const cfg = statusConfig[status] || statusConfig.draft;
-    return <span className={cfg.className}>{cfg.label}</span>;
+  const getStatusBadge = (status, item) => {
+    const baseClass = 'inline-block px-2 py-0.5 rounded text-xs cursor-pointer transition';
+
+    if (status === 'pending') {
+      return (
+        <span
+          onClick={() => handleOpenSession(item)}
+          className={`${baseClass} bg-yellow-100 text-yellow-800 hover:bg-yellow-200`}
+          title="اضغط لفتح خطة السلوك"
+        >
+          قيد المتابعة
+        </span>
+      );
+    }
+
+    if (status === 'applied') {
+      return <span className={`${baseClass} bg-green-100 text-green-800`}>مُطبّق</span>;
+    }
+
+    if (status === 'rejected') {
+      return <span className={`${baseClass} bg-red-100 text-red-800`}>مرفوض</span>;
+    }
+
+    return <span className={`${baseClass} bg-slate-100 text-slate-700`}>{status || '—'}</span>;
   };
+
 
   const handleStatusChange = (id, newStatus) => {
     if (!onUpdateData) {
@@ -122,8 +128,44 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
 
       const buildListHtml = (arr) => {
         if (!arr || !arr.length) return `<div>—</div>`;
-        return `<ul style="padding-inline-start:18px;margin:6px 0;">${arr.map(x => `<li style="margin:4px 0">${escapeHtml(String(typeof x === 'string' ? x : (x.text || x.name || JSON.stringify(x))))}</li>`).join('')}</ul>`;
+        return `<ul style="padding-inline-start:18px;margin:6px 0;">${arr.map(x => `<li style="margin:4px 0">${escapeHtml(String(typeof x === 'string' ? x : (x.text || x.name || x)))}</li>`).join('')}</ul>`;
       };
+
+      const getReinforcementHtml = (r) => {
+        if (!r) return `<div>—</div>`;
+        if (typeof r === 'string') return `<div>${escapeHtml(r)}</div>`;
+        // object
+        const type = escapeHtml(r.type || r.name || r.label || '-');
+        const schedule = escapeHtml(r.schedule || r.frequency || '-');
+        const notes = r.notes ? `<div style="margin-top:6px">${escapeHtml(String(r.notes))}</div>` : '';
+        return `<div><div><b>النوع:</b> ${type}</div><div><b>الجدول:</b> ${schedule}</div>${notes}</div>`;
+      };
+
+      const getGeneralizationHtml = (g) => {
+        if (!g) return `<div>—</div>`;
+        if (typeof g === 'string') return `<div>${escapeHtml(g)}</div>`;
+        if (Array.isArray(g)) return buildListHtml(g);
+        // object or other
+        try {
+          return `<div>${escapeHtml(JSON.stringify(g))}</div>`;
+        } catch (e) {
+          return `<div>—</div>`;
+        }
+      };
+
+      const reinforcementSource =
+        norm?.reinforcement ||
+        norm?.reinforcements ||
+        norm?.reinforcement_plan ||
+        norm?.reinforcementPlan ||
+        null;
+
+      const generalizationSource =
+        norm?.generalization_plan ||
+        norm?.generalization ||
+        norm?.generalisation ||
+        norm?.generalizationPlan ||
+        null;
 
       const html = `
         <div dir="rtl" style="font-family: 'Tahoma', 'Arial', sans-serif; color:#152238; background:#ffffff; padding:20px; width:794px; box-sizing:border-box;">
@@ -176,6 +218,16 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
             <div style="margin-bottom:8px;">
               <div style="font-size:13px;font-weight:600;color:#0f172a;margin-bottom:6px">خطة التنفيذ</div>
               ${buildListHtml(norm?.execution_plan)}
+            </div>
+
+            <div style="margin-bottom:8px;">
+              <div style="font-size:13px;font-weight:600;color:#0f172a;margin-bottom:6px">خطة التعزيز</div>
+              ${getReinforcementHtml(reinforcementSource)}
+            </div>
+
+            <div style="margin-bottom:8px;">
+              <div style="font-size:13px;font-weight:600;color:#0f172a;margin-bottom:6px">خطة التعميم</div>
+              ${getGeneralizationHtml(generalizationSource)}
             </div>
 
             <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;">
@@ -266,6 +318,23 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
     setDateRange('');
   };
 
+  // NEW: open session handler - calls parent callback if provided
+  const handleOpenSession = (item) => {
+    const shouldOpenChecklist = !!(item?.meta?.openChecklistOnOpen || item?.type === 'behavior_session');
+    if (typeof onOpenSession === 'function') {
+      // pass the full item and a small opts object
+      onOpenSession(item, { openChecklist: shouldOpenChecklist });
+      // optionally collapse expanded row
+      setExpandedRow(null);
+    } else {
+      toast({
+        title: 'تعذر فتح الجلسة',
+        description: 'لم يتم تمرير onOpenSession إلى SessionLog. اضبط onOpenSession(item, { openChecklist }) في المكوّن الأب.',
+        className: 'notification-warning'
+      });
+    }
+  };
+
   // utility to safely render arrays/strings
   const safeArray = (v) => {
     if (!v) return [];
@@ -274,7 +343,7 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
     return [];
   };
 
-  // Render a behavioral plan in readable form
+  // Render a behavioral plan in readable form (extended to include reinforcement & generalization)
   const renderBehaviorPlan = (plan) => {
     if (!plan) return <div>—</div>;
 
@@ -292,6 +361,21 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
     const safetyFlag = !!(plan.safety_flag || plan.safetyFlag);
     const suggestions = safeArray(plan.suggestions || []);
     const customizations = safeArray(plan.customizations || []);
+
+    // reinforcement & generalization (flexible keys)
+    const reinforcement =
+      plan.reinforcement ||
+      plan.reinforcements ||
+      plan.reinforcement_plan ||
+      plan.reinforcementPlan ||
+      null;
+
+    const generalization =
+      plan.generalization_plan ||
+      plan.generalization ||
+      plan.generalisation ||
+      plan.generalizationPlan ||
+      null;
 
     return (
       <div className="space-y-3">
@@ -369,6 +453,38 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
               مراجعة بعد: {reviewAfter} يومًا<br />
               حالة السلامة: {safetyFlag ? <span className="text-red-600 font-semibold">محتمل وجود خطر</span> : 'طبيعي/غير خطير'}
             </div>
+          </div>
+        </div>
+
+        {/* Reinforcement */}
+        <div>
+          <h5 className="text-sm font-medium text-slate-700">خطة التعزيز</h5>
+          <div className="text-slate-600 p-3 bg-white rounded border">
+            {reinforcement
+              ? (typeof reinforcement === 'string' ? reinforcement : (
+                <>
+                  <div><b>النوع:</b> {reinforcement.type || reinforcement.name || '-'}</div>
+                  <div><b>الجدول:</b> {reinforcement.schedule || reinforcement.frequency || '-'}</div>
+                  {reinforcement.notes ? <div><b>ملاحظات:</b> {reinforcement.notes}</div> : null}
+                </>
+              ))
+              : <div>—</div>
+            }
+          </div>
+        </div>
+
+        {/* Generalization */}
+        <div>
+          <h5 className="text-sm font-medium text-slate-700">خطة التعميم</h5>
+          <div className="text-slate-600 p-3 bg-white rounded border">
+            {generalization
+              ? (Array.isArray(generalization) ? (
+                <ul className="mt-2 text-slate-600 space-y-1">
+                  {generalization.map((g, i) => <li key={i}>• {g}</li>)}
+                </ul>
+              ) : (typeof generalization === 'string' ? generalization : JSON.stringify(generalization)))
+              : <div>—</div>
+            }
           </div>
         </div>
 
@@ -587,16 +703,31 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
                         <p className="text-sm text-slate-600 truncate max-w-xs">{item.text ? item.text.slice(0, 120) : 'ملاحظة صوتية'}</p>
                       </td>
 
-                      <td className="p-4">{getStatusBadge(item.status)}</td>
+                      <td className="p-4">{getStatusBadge(item.status, item)}
+                      </td>
 
                       <td className="p-4">
                         <div className="flex items-center gap-1">
-                          <Button size="sm" variant="ghost" onClick={() => handleViewDetails(item.id)} className="h-8 w-8 p-0">
+                          {/* view details (toggle) */}
+                          <Button size="sm" variant="ghost" onClick={() => handleViewDetails(item.id)} className="h-8 w-8 p-0" aria-label="عرض التفاصيل">
                             <Eye className="h-4 w-4" />
                           </Button>
 
-                          <Button size="sm" variant="ghost" onClick={() => handleExportPDF(item)} className="h-8 w-8 p-0">
+                          {/* export */}
+                          <Button size="sm" variant="ghost" onClick={() => handleExportPDF(item)} className="h-8 w-8 p-0" aria-label="تنزيل PDF">
                             <Download className="h-4 w-4" />
+                          </Button>
+
+                          {/* NEW: open in BehaviorPlan / open checklist */}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => handleOpenSession(item)}
+                            className="h-8 w-8 p-0"
+                            aria-label={(item?.meta?.openChecklistOnOpen || item?.type === 'behavior_session') ? 'فتح قائمة التحقق' : 'فتح الجلسة'}
+                            title={(item?.meta?.openChecklistOnOpen || item?.type === 'behavior_session') ? 'فتح قائمة التحقق' : 'فتح الجلسة'}
+                          >
+                            <FileText className="h-4 w-4" />
                           </Button>
                         </div>
                       </td>
@@ -618,10 +749,7 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
 
                               {/* Metadata */}
                               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                <div>
-                                  <h5 className="text-sm font-medium text-slate-700">المعرّف</h5>
-                                  <div className="text-sm text-slate-600">{item.id || '-'}</div>
-                                </div>
+
                                 <div>
                                   <h5 className="text-sm font-medium text-slate-700">توقيت الحفظ</h5>
                                   <div className="text-sm text-slate-600">{formatRelativeDate(item.meta?.savedAt || item.timestamp)}</div>
@@ -743,6 +871,42 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
                                         </div>
                                       )}
 
+                                      {/* reinforcement (new) */}
+                                      {(item.generatedPlan.normalized.reinforcement || item.generatedPlan.normalized.reinforcements || item.generatedPlan.normalized.reinforcement_plan) && (
+                                        <div>
+                                          <h5 className="text-sm font-medium text-slate-700">خطة التعزيز</h5>
+                                          <div className="text-slate-600 p-3 bg-white rounded border">
+                                            {(() => {
+                                              const r = item.generatedPlan.normalized.reinforcement || item.generatedPlan.normalized.reinforcements || item.generatedPlan.normalized.reinforcement_plan;
+                                              if (typeof r === 'string') return r;
+                                              return (
+                                                <>
+                                                  <div><b>النوع:</b> {r.type || r.name || r.label || '-'}</div>
+                                                  <div><b>الجدول:</b> {r.schedule || r.frequency || '-'}</div>
+                                                  {r.notes ? <div><b>ملاحظات:</b> {r.notes}</div> : null}
+                                                </>
+                                              );
+                                            })()}
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* generalization (new) */}
+                                      {(item.generatedPlan.normalized.generalization_plan || item.generatedPlan.normalized.generalization || item.generatedPlan.normalized.generalisation) && (
+                                        <div>
+                                          <h5 className="text-sm font-medium text-slate-700">خطة التعميم</h5>
+                                          <div className="text-slate-600 p-3 bg-white rounded border">
+                                            {(() => {
+                                              const g = item.generatedPlan.normalized.generalization_plan || item.generatedPlan.normalized.generalization || item.generatedPlan.normalized.generalisation;
+                                              if (!g) return '—';
+                                              if (Array.isArray(g)) return <ul className="list-disc pr-6 mt-2">{g.map((x, i) => <li key={i}>{x}</li>)}</ul>;
+                                              if (typeof g === 'string') return g;
+                                              return JSON.stringify(g);
+                                            })()}
+                                          </div>
+                                        </div>
+                                      )}
+
                                       {/* measurement */}
                                       {item.generatedPlan.normalized.measurement && (
                                         <div>
@@ -778,6 +942,16 @@ const SessionLog = ({ data = [], onUpdateData, onReloadSessions, isLoadingSessio
                                   <audio controls src={item.audioUrl} className="w-full" />
                                 </div>
                               )}
+
+                              {/* NEW: CTA to open session / checklist */}
+                              {(item?.meta?.openChecklistOnOpen || item?.type === 'behavior_session') && (
+                                <div className="pt-2">
+                                  <Button onClick={() => handleOpenSession(item)} variant="outline">
+                                    فتح قائمة التحقق (راجع الجلسة)
+                                  </Button>
+                                </div>
+                              )}
+                              {/* end NEW */}
                             </div>
                           </td>
                         </motion.tr>

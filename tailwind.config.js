@@ -1,76 +1,34 @@
-/** @type {import('tailwindcss').Config} */
+// tailwind.config.cjs
 module.exports = {
-	darkMode: ['class'],
-	content: [
-		'./pages/**/*.{js,jsx}',
-		'./components/**/*.{js,jsx}',
-		'./app/**/*.{js,jsx}',
-		'./src/**/*.{js,jsx}',
-	],
+	content: ['./index.html', './src/**/*.{js,jsx,ts,tsx}'],
 	theme: {
-		container: {
-			center: true,
-			padding: '2rem',
-			screens: {
-				'2xl': '1400px',
-			},
-		},
 		extend: {
 			colors: {
-				border: 'hsl(var(--border))',
-				input: 'hsl(var(--input))',
-				ring: 'hsl(var(--ring))',
-				background: 'hsl(var(--background))',
-				foreground: 'hsl(var(--foreground))',
-				primary: {
-					DEFAULT: 'hsl(var(--primary))',
-					foreground: 'hsl(var(--primary-foreground))',
-				},
-				secondary: {
-					DEFAULT: 'hsl(var(--secondary))',
-					foreground: 'hsl(var(--secondary-foreground))',
-				},
-				destructive: {
-					DEFAULT: 'hsl(var(--destructive))',
-					foreground: 'hsl(var(--destructive-foreground))',
+				brand: {
+					50: '#f0fbf6',
+					100: '#dff7ec',
+					200: '#bff0d9',
+					300: '#99e6c0',
+					400: '#66d3a0',
+					500: '#35b97a',
+					600: '#2f9e66',
+					700: '#257b4f',
+					800: '#1b5b3a',
+					900: '#123826'
 				},
 				muted: {
-					DEFAULT: 'hsl(var(--muted))',
-					foreground: 'hsl(var(--muted-foreground))',
-				},
-				accent: {
-					DEFAULT: 'hsl(var(--accent))',
-					foreground: 'hsl(var(--accent-foreground))',
-				},
-				popover: {
-					DEFAULT: 'hsl(var(--popover))',
-					foreground: 'hsl(var(--popover-foreground))',
-				},
-				card: {
-					DEFAULT: 'hsl(var(--card))',
-					foreground: 'hsl(var(--card-foreground))',
-				},
+					50: '#fbfcfd',
+					100: '#f3f6f7',
+					200: '#e9eef0',
+				}
 			},
-			borderRadius: {
-				lg: 'var(--radius)',
-				md: 'calc(var(--radius) - 2px)',
-				sm: 'calc(var(--radius) - 4px)',
+			fontFamily: {
+				sans: ['Cairo', 'Inter', 'system-ui', 'sans-serif'],
 			},
-			keyframes: {
-				'accordion-down': {
-					from: { height: 0 },
-					to: { height: 'var(--radix-accordion-content-height)' },
-				},
-				'accordion-up': {
-					from: { height: 'var(--radix-accordion-content-height)' },
-					to: { height: 0 },
-				},
-			},
-			animation: {
-				'accordion-down': 'accordion-down 0.2s ease-out',
-				'accordion-up': 'accordion-up 0.2s ease-out',
-			},
+			boxShadow: {
+				card: '0 8px 20px rgba(16,24,40,0.06), 0 2px 6px rgba(16,24,40,0.04)'
+			}
 		},
 	},
-	plugins: [require('tailwindcss-animate')],
+	plugins: [],
 };

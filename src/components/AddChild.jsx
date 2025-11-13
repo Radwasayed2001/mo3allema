@@ -1,243 +1,182 @@
 // src/components/AddChild.jsx
 import React, { useState } from 'react';
 import { motion } from 'framer-motion';
-import {
-  UserPlus,
-  User,
-  Phone,
-  MessageCircle,
-  Save,
-  Loader2,
-  AlertCircle
-} from 'lucide-react';
+import { UserPlus, Save, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { db } from '@/lib/firebaseConfig';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { useAssessment } from '../hooks/useAssessment';
+import Stepper from './Stepper';
+import Report from './Report';
+import { assessmentSteps } from '../data/assessmentContent';
+import * as Steps from './AssessmentSteps';
 
-const FormField = React.memo(function FormField({
-  name,
-  label,
-  placeholder,
-  icon: Icon,
-  type = "text",
-  value,
-  onChange,
-  error,
-  disabled
-}) {
-  return (
-    <div className="space-y-2">
-      <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-        {Icon && <Icon className="h-4 w-4" />}
-        {label}
-      </label>
-      <input
-        type={type}
-        name={name}
-        value={value}
-        onChange={onChange}
-        placeholder={placeholder}
-        className={`w-full p-3 border rounded-lg input-focus ${error ? 'border-red-300 bg-red-50' : 'border-slate-200'
-          }`}
-        disabled={disabled}
-      />
-      {error && (
-        <div className="flex items-center gap-2 text-red-600 text-sm">
-          <AlertCircle className="h-4 w-4" />
-          {error}
-        </div>
-      )}
-    </div>
-  );
-});
+const FALLBACKS = {
+  phoneNumber: "+201101332094",
+  whatsappNumber: "+201101332094",
+  schoolId: "gOtTEy1oqSncU99AEZW9",
+  teacherId: "1DRgUCXGrMa54sIru9WK6FNpuud2"
+};
 
-// --- (تم تعديل Props هنا) ---
 const AddChild = ({ userSchoolId, teacherId }) => {
-  const [formData, setFormData] = useState({
-    childName: '',
-    parentName: '',
-    phoneNumber: '',
-    whatsappNumber: ''
-  });
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [errors, setErrors] = useState({});
   const { toast } = useToast();
+  const {
+    currentStep,
+    data,
+    updateData,
+    goToNextStep,
+    goToPrevStep,
+    isFirstStep,
+    isLastStep,
+    totalSteps,
+    exclusionTriggered
+  } = useAssessment();
 
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
-    if (errors[name]) {
-      setErrors(prev => ({ ...prev, [name]: '' }));
+  const [submitting, setSubmitting] = useState(false);
+
+  const validateBeforeSave = () => {
+    const name = data?.basicInfo?.childName?.toString().trim();
+    if (!name) {
+      toast({
+        title: "حقل مفقود",
+        description: "يرجى إدخال اسم الطفل قبل الحفظ.",
+        variant: "destructive"
+      });
+      return false;
     }
+    return true;
   };
 
-  const validateForm = () => {
-    const newErrors = {};
-    if (!formData.childName.trim()) newErrors.childName = 'اسم الطفل مطلوب';
-    if (!formData.parentName.trim()) newErrors.parentName = 'اسم ولي الأمر مطلوب';
-    if (!formData.phoneNumber.trim()) newErrors.phoneNumber = 'رقم الهاتف مطلوب';
-    if (!formData.whatsappNumber.trim()) newErrors.whatsappNumber = 'رقم الواتساب مطلوب';
-    
-    // (يمكن إضافة تحقق من صحة الأرقام هنا)
+  const mapToPayload = () => {
+    const appVersion = (globalThis).__APP_VERSION__ ?? '0.0.0';
+    const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown';
+    const locale = typeof navigator !== 'undefined' ? navigator.language : 'ar';
 
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
+    const basic = { ...(data.basicInfo || {}) };
+    basic.phoneNumber = (basic.phoneNumber && basic.phoneNumber.toString()) || FALLBACKS.phoneNumber;
+    basic.whatsappNumber = (basic.whatsappNumber && basic.whatsappNumber.toString()) || FALLBACKS.whatsappNumber;
+    basic.schoolId = userSchoolId || basic.schoolId || FALLBACKS.schoolId;
+    basic.teacherId = teacherId || basic.teacherId || FALLBACKS.teacherId;
+
+    const scaleA_Total = Object.values(data.scaleA).flatMap(domain => Object.values(domain)).reduce((a, b) => a + (Number(b) || 0), 0);
+    const scaleB_Total = Object.values(data.scaleB).reduce((a, b) => a + (Number(b) || 0), 0);
+    const scaleL_Total = Object.values(data.scaleL).reduce((a, b) => a + (Number(b) || 0), 0);
+
+    const decision = exclusionTriggered ? 'excluded'
+      : (scaleA_Total >= 25 && scaleB_Total <= 8) ? 'eligible'
+        : ((scaleA_Total < 15) || (scaleB_Total > 11)) ? 'not_eligible'
+          : 'boundary';
+
+    return {
+      assessmentData: { ...data, basicInfo: basic },
+      decision,
+      scores: { scaleA_Total, scaleB_Total, scaleL_Total },
+      metadata: { appVersion, userAgent, locale },
+      evaluatorId: teacherId || basic.teacherId || 'anon'
+    };
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!validateForm()) {
-      toast({
-        title: "خطأ في البيانات",
-        description: "يرجى تصحيح الأخطاء في النموذج",
-        className: "notification-error"
-      });
-      return;
-    }
-    
-    // --- (التحقق من Props) ---
-    if (!userSchoolId || !teacherId) {
-      toast({
-        title: "خطأ في الصلاحيات",
-        description: "لا يمكن إضافة طفل بدون معرّف المدرسة والمعلمة.",
-        className: "notification-error"
-      });
-      return;
-    }
+  const handleSaveAssessment = async () => {
+    if (!validateBeforeSave()) return;
 
-    setIsSubmitting(true);
-
+    setSubmitting(true);
     try {
-      // --- (تم تعديل addDoc هنا) ---
-      const docRef = await addDoc(collection(db, "children"), {
-        childName: formData.childName.trim(),
-        parentName: formData.parentName.trim(),
-        phoneNumber: formData.phoneNumber.trim(),
-        whatsappNumber: formData.whatsappNumber.trim(),
-        schoolId: userSchoolId,  // <-- ID المدرسة
-        teacherId: teacherId,    // <-- ID المعلمة
+      const payload = mapToPayload();
+      const doc = await addDoc(collection(db, 'assessments'), {
+        ...payload,
         createdAt: serverTimestamp()
       });
 
-      console.log("Child added with ID: ", docRef.id);
-      setFormData({
-        childName: '',
-        parentName: '',
-        phoneNumber: '',
-        whatsappNumber: ''
-      });
-
       toast({
-        title: "تم إضافة الطفل بنجاح! ✅",
-        description: `تم حفظ بيانات ${formData.childName} في النظام`,
+        title: "تم حفظ التقرير",
+        description: `تم إنشاء تقرير برقم: ${doc.id}`,
         className: "notification-success"
       });
-
-    } catch (error) {
-      console.error("Error adding child: ", error);
+    } catch (err) {
+      console.error("Failed to save assessment:", err);
       toast({
-        title: "خطأ في الحفظ",
-        description: "حدث خطأ أثناء حفظ بيانات الطفل.",
-        className: "notification-error"
+        title: "فشل الحفظ",
+        description: "حدث خطأ أثناء حفظ التقرير. تأكدي من صلاحيات الكتابة في Firestore.",
+        variant: "destructive"
       });
     } finally {
-      setIsSubmitting(false);
+      setSubmitting(false);
     }
   };
 
+  const CurrentStepComponent = (Steps)[`Step${currentStep + 1}`];
+
+  const progressPct = Math.round(((currentStep) / Math.max(1, totalSteps - 1)) * 100);
+
+  // داخل ملف src/components/AddChild.jsx — استخدم هذا الجزء كـ wrapper رئيسي (replace the top-level return)
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="bg-gradient-to-r from-blue-500 to-blue-600 rounded-xl p-6 text-white"
-      >
-        <div className="flex items-center gap-3 mb-2">
-          <UserPlus className="h-6 w-6" />
-          <h2 className="text-2xl font-bold">إضافة طفل جديد</h2>
-        </div>
-        <p className="text-blue-100">أدخل بيانات الطفل الجديد لحفظها في النظام</p>
-      </motion.div>
-
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.1 }}
-        className="bg-white rounded-xl shadow-lg border border-slate-200 p-6"
-      >
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <FormField
-              name="childName"
-              label="اسم الطفل"
-              placeholder="أدخل اسم الطفل"
-              icon={User}
-              value={formData.childName}
-              onChange={handleInputChange}
-              error={errors.childName}
-              disabled={isSubmitting}
-            />
-            <FormField
-              name="parentName"
-              label="اسم ولي الأمر"
-              placeholder="أدخل اسم ولي الأمر"
-              icon={User}
-              value={formData.parentName}
-              onChange={handleInputChange}
-              error={errors.parentName}
-              disabled={isSubmitting}
-            />
+    <div className="min-h-screen bg-gray-50 text-slate-800">
+      <div className="max-w-full mx-auto px-4 sm:px-6 lg:px-8 py-6" dir="rtl">
+        {/* Top banner (smaller padding so doesn't take too much vertical space) */}
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="bg-gradient-to-r from-brand-600 to-brand-500 rounded-xl p-4 sm:p-5 text-white mb-6 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <UserPlus className="h-6 w-6" />
+            <div>
+              <h2 className="text-lg sm:text-2xl font-bold leading-tight">استمارة التقييم — برنامج تبيان</h2>
+              <p className="text-xs sm:text-sm text-white/90">املئي الخطوات كاملة ثم احفظي التقرير.</p>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <FormField
-              name="phoneNumber"
-              label="رقم الهاتف"
-              placeholder="مثال: +966501234567"
-              icon={Phone}
-              type="tel"
-              value={formData.phoneNumber}
-              onChange={handleInputChange}
-              error={errors.phoneNumber}
-              disabled={isSubmitting}
-            />
-            <FormField
-              name="whatsappNumber"
-              label="رقم الواتساب"
-              placeholder="مثال: +966501234567"
-              icon={MessageCircle}
-              type="tel"
-              value={formData.whatsappNumber}
-              onChange={handleInputChange}
-              error={errors.whatsappNumber}
-              disabled={isSubmitting}
-            />
-          </div>
-
-          <div className="pt-4 border-t border-slate-200">
-            <Button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full btn-primary"
-            >
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="h-4 w-4 ml-2 animate-spin" />
-                  جاري الحفظ...
-                </>
-              ) : (
-                <>
-                  <Save className="h-4 w-4 ml-2" />
-                  إضافة الطفل
-                </>
-              )}
+          <div className="flex items-center gap-2">
+            <Button onClick={handleSaveAssessment} disabled={submitting} className="bg-white text-brand-600 text-sm px-3 py-1.5">
+              {submitting ? <><Loader2 className="h-4 w-4 animate-spin mr-2" /> جاري الحفظ...</> : <><Save className="h-4 w-4 mr-2" /> حفظ التقرير</>}
             </Button>
           </div>
-        </form>
-      </motion.div>
+        </motion.div>
+
+        {/* Main grid: content + sidebar */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* main content (takes 9/12 on lg) */}
+          <div className="lg:col-span-12 space-y-6">
+            <div className="bg-white rounded-2xl shadow border border-slate-100 p-4 sm:p-5">
+              {/* Stepper (wrap overflow inside card) */}
+              <div className="mb-3">
+                <div className="overflow-x-auto no-scrollbar -mx-4 px-4">
+                  <Stepper currentStep={currentStep} steps={assessmentSteps.map(s => s.title)} />
+                </div>
+              </div>
+
+              <main className="mt-4">
+                {currentStep < totalSteps - 1 ? (
+                  <>
+                    <div className="mb-4">
+                      <h3 className="text-lg font-semibold text-brand-700">{assessmentSteps[currentStep].title}</h3>
+                      {assessmentSteps[currentStep].description && <p className="text-sm text-slate-600">{assessmentSteps[currentStep].description}</p>}
+                    </div>
+                    {CurrentStepComponent ? <CurrentStepComponent data={data} updateData={updateData} /> : <div className="text-red-600">خطأ: مكوّن الخطوة غير موجود</div>}
+                  </>
+                ) : (
+                  <Report data={data} exclusionTriggered={exclusionTriggered} />
+                )}
+              </main>
+
+              {/* footer navigation */}
+              {currentStep < totalSteps - 1 && (
+                <footer className="mt-6 pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <Button variant="outline" onClick={goToPrevStep} disabled={isFirstStep}>السابق</Button>
+                  </div>
+
+                  <div className="flex items-center gap-3 ml-auto">
+                    <Button onClick={handleSaveAssessment} className="bg-yellow-50 text-yellow-800 border border-yellow-200">حفظ مؤقت</Button>
+                    <Button onClick={goToNextStep} className="bg-brand-600 text-white">{currentStep + 1 === totalSteps - 1 ? 'عرض التقرير' : 'التالي'}</Button>
+                  </div>
+                </footer>
+              )}
+            </div>
+          </div>
+
+        </div>
+      </div>
     </div>
   );
+
 };
 
 export default AddChild;

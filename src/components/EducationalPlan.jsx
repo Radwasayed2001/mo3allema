@@ -29,7 +29,10 @@ import {
   serverTimestamp,
   query,
   where,
-  getDocs
+  getDocs,
+  orderBy,
+  limit,
+  onSnapshot
 } from 'firebase/firestore';
 
 // IMPORTANT: use named import for modern jspdf
@@ -155,37 +158,362 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
     return null;
   };
 
+  // -------------------------
+  // Helpers for fetching assessments (client-side)
+  // using onSnapshot wrapper to behave like a single-shot fetch (as requested)
+  // -------------------------
+
+  // helper: normalize Arabic name (trim, collapse spaces, remove tashkeel)
+  const normalizeNameForSearch = (n) => {
+    if (!n) return '';
+    const removeDiacritics = (s) =>
+      s.replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]/g, '');
+    return removeDiacritics(String(n).trim()).replace(/\s+/g, ' ');
+  };
+
+  // helper: recursively serialize Firestore values (Timestamp -> ISO)
+  const serializeFirestoreData = (obj) => {
+    if (obj === null || obj === undefined) return obj;
+    if (typeof obj.toDate === 'function') {
+      try { return obj.toDate().toISOString(); } catch (e) { return String(obj); }
+    }
+    if (Array.isArray(obj)) return obj.map(serializeFirestoreData);
+    if (typeof obj === 'object') {
+      const out = {};
+      for (const k of Object.keys(obj)) {
+        try { out[k] = serializeFirestoreData(obj[k]); } catch (e) { out[k] = String(obj[k]); }
+      }
+      return out;
+    }
+    return obj;
+  };
+
+  // tiny wrapper: run onSnapshot once and resolve with first snapshot (or null)
+  const snapshotOnce = (q) => {
+    return new Promise((resolve) => {
+      let unsub = () => { };
+      try {
+        unsub = onSnapshot(q, (snap) => {
+          unsub();
+          if (!snap.empty) resolve(snap);
+          else resolve(null);
+        }, (err) => {
+          unsub();
+          console.warn('snapshotOnce error', err);
+          resolve(null);
+        });
+      } catch (e) {
+        try { unsub(); } catch { }
+        console.warn('snapshotOnce threw', e);
+        resolve(null);
+      }
+    });
+  };
+
+  // improved client-side fetch by name with multiple fallbacks
+  const fetchAssessmentByChildNameClient = async (childNameToFind) => {
+    if (!childNameToFind || !String(childNameToFind).trim()) return null;
+    const raw = String(childNameToFind);
+    const nameTry = normalizeNameForSearch(raw);
+
+    try {
+      const col = collection(db, 'assessments');
+
+      // 1) try exact match on stored field (raw)
+      try {
+        const q1 = query(col, where('assessmentData.basicInfo.childName', '==', raw), limit(1));
+        const snap1 = await snapshotOnce(q1);
+        if (snap1 && !snap1.empty) {
+          const d = snap1.docs[0];
+          return { id: d.id, data: serializeFirestoreData(d.data()) };
+        }
+      } catch (e) { /* ignore */ }
+
+      // 2) try normalized exact
+      try {
+        const q2 = query(col, where('assessmentData.basicInfo.childName', '==', nameTry), limit(1));
+        const snap2 = await snapshotOnce(q2);
+        if (snap2 && !snap2.empty) {
+          const d = snap2.docs[0];
+          return { id: d.id, data: serializeFirestoreData(d.data()) };
+        }
+      } catch (e) { /* ignore */ }
+
+      // 3) prefix search (range)
+      try {
+        const start = nameTry;
+        const end = nameTry + '\uf8ff';
+        const q3 = query(col, where('assessmentData.basicInfo.childName', '>=', start), where('assessmentData.basicInfo.childName', '<=', end), limit(3));
+        const snap3 = await snapshotOnce(q3);
+        if (snap3 && !snap3.empty) {
+          const d = snap3.docs[0];
+          return { id: d.id, data: serializeFirestoreData(d.data()) };
+        }
+      } catch (e) { /* ignore */ }
+
+      // 4) small batch and client-side normalized compare
+      try {
+        const q4 = query(col, limit(20));
+        const snap4 = await snapshotOnce(q4);
+        if (snap4 && !snap4.empty) {
+          for (const d of snap4.docs) {
+            const data = d.data();
+            const stored = (data?.assessmentData?.basicInfo?.childName) || data?.childName || '';
+            if (normalizeNameForSearch(stored) === nameTry) {
+              return { id: d.id, data: serializeFirestoreData(data) };
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+
+      // 5) fallback to 'children' collection
+      try {
+        const childrenCol = collection(db, 'children');
+        const q5 = query(childrenCol, where('name', '==', raw), limit(1));
+        const snap5 = await snapshotOnce(q5);
+        if (snap5 && !snap5.empty) {
+          const d = snap5.docs[0];
+          return { id: d.id, data: serializeFirestoreData(d.data()) };
+        }
+      } catch (e) { /* ignore */ }
+
+      return null;
+    } catch (err) {
+      console.error('fetchAssessmentByChildNameClient final error:', err);
+      return null;
+    }
+  };
+
+  // improved findParentByChildName that uses assessment fallback and returns parent phone fields
+  const findParentByChildName = async (childNameToFind) => {
+    try {
+      const assessmentDoc = await fetchAssessmentByChildNameClient(childNameToFind);
+      if (assessmentDoc && assessmentDoc.data) {
+        // try to find phone fields inside assessmentData.basicInfo
+        const basic = assessmentDoc.data?.assessmentData?.basicInfo || assessmentDoc.data?.basicInfo || assessmentDoc.data || {};
+        // normalize keys (some docs may have 'parentPhone' or 'whatsappNumber' etc)
+        const phone = basic.whatsappNumber || basic.phoneNumber || basic.parentPhone || basic.contactPhone || null;
+        return { source: 'assessments', id: assessmentDoc.id, basic, phone };
+      }
+
+      // fallback to children collection then
+      try {
+        const col = collection(db, 'children');
+        const q = query(col, where('name', '==', childNameToFind), limit(1));
+        const snap = await snapshotOnce(q);
+        if (snap && !snap.empty) {
+          const d = snap.docs[0];
+          const data = serializeFirestoreData(d.data());
+          const phone = data.whatsappNumber || data.phoneNumber || data.parentPhone || null;
+          return { source: 'children', id: d.id, basic: data, phone };
+        }
+      } catch (e) { /* ignore */ }
+
+      return null;
+    } catch (err) {
+      console.error('findParentByChildName error (improved):', err);
+      return null;
+    }
+  };
+
+  // ==== stringify helpers (unchanged) ====
+  const stringifyItem = (it) => {
+    if (it === null || it === undefined) return '';
+    if (typeof it === 'string') return it.trim();
+    if (typeof it === 'number') return String(it);
+
+    if (typeof it === 'object') {
+      if (typeof it.text === 'string' && it.text.trim()) {
+        const base = it.text.trim();
+        if (it.rationale && typeof it.rationale === 'string' && it.rationale.trim()) {
+          return `${base} — ${it.rationale.trim()}`;
+        }
+        return base;
+      }
+      if (typeof it.name === 'string' && it.name.trim()) {
+        const base = it.name.trim();
+        if (it.type && typeof it.type === 'string') return `${it.type}: ${base}`;
+        return base;
+      }
+      if (typeof it.title === 'string' && it.title.trim()) return it.title.trim();
+      if (typeof it.label === 'string' && it.label.trim()) return it.label.trim();
+
+      try {
+        const j = JSON.stringify(it);
+        return j.length > 160 ? j.slice(0, 160) + '...' : j;
+      } catch (e) {
+        return String(it);
+      }
+    }
+    return String(it);
+  };
+
+  const formatArray = (arr = [], { numbered = true, max = 20 } = {}) => {
+    if (!Array.isArray(arr) || arr.length === 0) return '';
+    const items = arr.slice(0, max).map((x, i) => {
+      const text = stringifyItem(x).replace(/\s+/g, ' ').trim();
+      if (!text) return null;
+      return numbered ? `${i + 1}. ${text}` : `- ${text}`;
+    }).filter(Boolean);
+    return items.join('\n\n');
+  };
+
+  const tidy = (s) => (s || '').replace(/\n{3,}/g, '\n\n').trim();
+
+  const composeWhatsAppMessage = ({ childName, planObj, sessionId }) => {
+    const norm = (planObj && (planObj.normalized || planObj)) || {};
+    const name = childName || 'الطفل';
+
+    const smartGoal = stringifyItem(norm.smart_goal || norm.summary || '-');
+    const teachingStrategy = stringifyItem(norm.teaching_strategy || '-');
+
+    let taskAnalysis = '';
+    if (Array.isArray(norm.task_analysis_steps) && norm.task_analysis_steps.length) {
+      taskAnalysis = formatArray(norm.task_analysis_steps, { numbered: true, max: 30 });
+    } else if (typeof norm.task_analysis_steps === 'string' && norm.task_analysis_steps.trim()) {
+      taskAnalysis = norm.task_analysis_steps
+        .split(/\r?\n/)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map((s, i) => `${i + 1}. ${s}`)
+        .join('\n\n');
+    }
+
+    const subgoals = formatArray(norm.subgoals || [], { numbered: true, max: 12 });
+    let activitiesText = '';
+    if (Array.isArray(norm.activities) && norm.activities.length) {
+      activitiesText = formatArray(norm.activities.map(a => {
+        if (!a) return '';
+        if (typeof a === 'string') return a;
+        if (typeof a === 'object') {
+          const type = a.type || a.category || '';
+          const nameAct = a.name || a.title || a.label || '';
+          if (type && nameAct) return `${type}: ${nameAct}`;
+          return a.name || a.title || a.label || stringifyItem(a);
+        }
+        return String(a);
+      }), { numbered: false, max: 20 });
+    }
+
+    const executionPlan = formatArray(norm.execution_plan || [], { numbered: true, max: 20 });
+
+    const reinforcementType = stringifyItem(norm.reinforcement?.type || '-');
+    const reinforcementSchedule = stringifyItem(norm.reinforcement?.schedule || '-');
+
+    const measurementType = stringifyItem(norm.measurement?.type || '-');
+    const measurementSheet = stringifyItem(norm.measurement?.sheet || '-');
+
+    const generalization = formatArray(norm.generalization_plan || [], { numbered: true, max: 12 });
+    const accommodations = formatArray(norm.accommodations || [], { numbered: true, max: 12 });
+
+    const suggestions = formatArray(norm.suggestions || norm.customizations || [], { numbered: true, max: 8 });
+
+    const sessionLinkPart = sessionId ? `\n\nمعرّف الجلسة: ${sessionId} (افتحوا التطبيق لمزيد من التفاصيل)` : '';
+
+    const parts = [
+      `السلام عليكم، هذا ملخص خطة تعليمية لـ *${name}*:`,
+
+      `\n*الهدف الذكي (SMART):*\n\n${smartGoal}`,
+
+      `\n*الاستراتيجية التعليمية:*\n\n${teachingStrategy}`,
+
+      taskAnalysis ? `\n*تحليل المهمة (خطوات):*\n\n${taskAnalysis}` : '',
+
+      subgoals ? `\n*الأهداف الفرعية:*\n\n${subgoals}` : '',
+
+      activitiesText ? `\n*الأنشطة المقترحة:*\n\n${activitiesText}` : '',
+
+      executionPlan ? `\n*الخطة التنفيذية:*\n\n${executionPlan}` : '',
+
+      `\n*خطة التعزيز:*\n\n- النوع: ${reinforcementType}\n\n- الجدول: ${reinforcementSchedule}`,
+
+      `\n*قياس الأداء:*\n\n- الطريقة: ${measurementType}\n\n- الأداة: ${measurementSheet}`,
+
+      generalization ? `\n*خطة التعميم:*\n\n${generalization}` : '',
+
+      accommodations ? `\n*التكييفات المقترحة:*\n\n${accommodations}` : '',
+
+      suggestions ? `\n*اقتراحات سريعة:*\n\n${suggestions}` : '',
+
+      sessionLinkPart,
+
+      `\nمن منصة تِبيان — لأي استفسار راسلونا`
+    ];
+
+    const message = tidy(parts.filter(Boolean).join('\n\n'));
+    return message;
+  };
+
+  const sanitizePhoneForWaMe = (raw) => {
+    if (!raw) return null;
+    const digits = raw.replace(/\D/g, '');
+    return digits || null;
+  };
+
+  const openWhatsAppChat = (phoneDigits, message) => {
+    if (!phoneDigits) throw new Error('رقم غير صالح');
+    const encoded = encodeURIComponent(message);
+    const url = `https://wa.me/${phoneDigits}?text=${encoded}`;
+    const win = window.open(url, '_blank');
+    if (!win) window.location.href = url;
+  };
+
+  // ========== التغيير الرئيسي: نرسل childName + assessment/report data إلى الـ backend ==========
   const handleGeneratePlan = async () => {
-    if (!formData.goal || formData.goal.trim() === '') {
-      toast({ title: "حقل مطلوب", description: "يرجى إدخال الهدف العام للخطة.", className: "notification-warning" });
+    const lookupName = (formData.childName && formData.childName.trim()) || (currentChild && currentChild.trim());
+    if (!lookupName) {
+      toast({ title: "اسم الطفل مطلوب", description: "لأن التحليل يعتمد على اسم الطفل فقط — يرجى إدخال اسم الطفل أو اختياره.", className: "notification-warning" });
       return;
     }
+
     setIsGenerating(true);
     setGeneratedPlan(null);
 
-    const noteText = [
-      `الطفل: ${formData.childName || currentChild || 'غير محدد'}`,
-      `العمر: ${formData.age || 'غير محدد'}`,
-      `المجال: ${formData.domain}`,
-      `المستوى: ${formData.level}`,
-      `الهدف: ${formData.goal}`,
-      `القيود: ${formData.constraints || 'لا توجد'}`,
-      `البيئة: ${formData.environment}`
-    ].join('\n');
+    // Attempt to fetch assessment/report data from Firestore to include in request
+    toast({ title: 'جاري جلب بيانات الاستبيان/التقرير (إن وُجد)...', className: 'notification-info', duration: 2000 });
+    let assessmentDoc = null;
+    try {
+      assessmentDoc = await fetchAssessmentByChildNameClient(lookupName);
+      if (assessmentDoc) {
+        console.log('[EducationalPlan] found assessmentDoc:', assessmentDoc);
+        toast({ title: 'تم العثور على استبيان', description: `id: ${assessmentDoc.id}`, className: 'notification-success', duration: 2000 });
+      } else {
+        toast({ title: 'لا توجد استبيانات محفوظة لهذا الاسم', className: 'notification-warning', duration: 2000 });
+      }
+    } catch (e) {
+      console.warn('handleGeneratePlan: error fetching assessment', e);
+    }
 
-    const endpoint = 'https://tebyan-backend.vercel.app/api/analyze';
+    const endpoint = 'http://localhost:3001/api/analyze';
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     try {
+      // build payload AFTER fetching assessment (prevents payload undefined bug)
       const payload = {
-        textNote: noteText,
+        childName: lookupName,
         currentActivity: formData.domain,
-        energyLevel: 3,
-        tags: [],
-        sessionDuration: 0,
-        curriculumQuery: formData.goal
+        curriculumQuery: formData.goal,
+        analysisType: 'general',
+        planRequestMeta: {
+          formData,
+          requestedByTeacherId: teacherId || null,
+          requestedBySchoolId: userSchoolId || null,
+          localTimestamp: new Date().toISOString()
+        }
       };
+
+      if (assessmentDoc) {
+        payload.assessmentDoc = assessmentDoc; // { id, data }
+        payload.assessmentData = assessmentDoc.data.assessmentData || assessmentDoc.data || null;
+        payload.assessmentReport = assessmentDoc.data.report || assessmentDoc.data.familyReport || null;
+      }
+
+      console.debug('[EducationalPlan] sending payload to analyze endpoint', {
+        hasAssessment: !!assessmentDoc,
+        childName: payload.childName,
+        meta: payload.planRequestMeta
+      });
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -245,19 +573,18 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       setIsGenerating(false);
     }
   };
+  // ========== نهاية التعديل الرئيسي ==========
 
   const sanitizeForFirestore = (obj) => {
     try { return JSON.parse(JSON.stringify(obj)); } catch (e) { return { note: 'unserializable' }; }
   };
 
-  // --- (التعديل 2: دالة الحفظ المعدلة) ---
   const handleSaveSession = async () => {
     if (!generatedPlan) {
       toast({ title: 'لا توجد خطة للحفظ', description: 'توليد الخطة أولاً قبل الحفظ.', className: 'notification-warning' });
       return null;
     }
 
-    // --- (التحقق من Props) ---
     if (!userSchoolId || !teacherId) {
       toast({
         title: "خطأ في الصلاحيات",
@@ -276,8 +603,8 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
         generatedPlan: sanitizeForFirestore(generatedPlan),
         meta: { source: generatedPlan.source || 'local', savedAtLocal: new Date().toISOString() },
         createdAt: serverTimestamp(),
-        schoolId: userSchoolId,  // <-- موجود
-        teacherId: teacherId    // <-- هذا هو التعديل
+        schoolId: userSchoolId,
+        teacherId: teacherId
       };
 
       const docRef = await addDoc(collection(db, 'sessions'), payload);
@@ -296,45 +623,6 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
     } finally {
       setIsSaving(false);
     }
-  };
-  // --- (نهاية التعديل 2) ---
-
-  const findParentByChildName = async (childNameToFind) => {
-    try {
-      const q = query(collection(db, 'children'), where('childName', '==', childNameToFind));
-      const snap = await getDocs(q);
-      if (snap.empty) return null;
-      const doc0 = snap.docs[0];
-      return { id: doc0.id, ...doc0.data() };
-    } catch (err) {
-      console.error('findParentByChildName error:', err);
-      return null;
-    }
-  };
-
-  // whatsapp helpers (unchanged)
-  const composeWhatsAppMessage = ({ childName, planObj, sessionId }) => {
-    const norm = planObj.normalized || planObj;
-    const name = childName || 'الطفل';
-    const goal = norm.smart_goal || norm.summary || 'خطة تعليمية مخصصة';
-    const topSuggestions = (norm.suggestions && norm.suggestions.slice(0, 3)) || (norm.subgoals && norm.subgoals.slice(0, 3)) || [];
-    const suggestionsText = topSuggestions.length ? '\n\nاقتراحات سريعة:\n' + topSuggestions.map((s, i) => `${i + 1}. ${s}`).join('\n') : '';
-    const linkText = sessionId ? `\n\nمعرّف الجلسة: ${sessionId} (افتحوا التطبيق لمزيد من التفاصيل)` : '';
-    return `السلام عليكم، هذا ملخص خطة تعليمية لـ ${name}:\n\nالهدف الذكي (SMART):\n${goal}\n\nالاستراتيجية التعليمية:\n${norm.teaching_strategy || '-'}\n\nتحليل المهمة (خطوات):\n${(norm.task_analysis_steps || []).map((st, i) => `${i + 1}. ${st}`).join('\n')}\n${suggestionsText}${linkText}\n\nمن منصة تِبيان — لأي استفسار راسلونا.`;
-  };
-
-  const sanitizePhoneForWaMe = (raw) => {
-    if (!raw) return null;
-    const digits = raw.replace(/\D/g, '');
-    return digits || null;
-  };
-
-  const openWhatsAppChat = (phoneDigits, message) => {
-    if (!phoneDigits) throw new Error('رقم غير صالح');
-    const encoded = encodeURIComponent(message);
-    const url = `https://wa.me/${phoneDigits}?text=${encoded}`;
-    const win = window.open(url, '_blank');
-    if (!win) window.location.href = url;
   };
 
   const handleSendWhatsApp = async () => {
@@ -356,7 +644,8 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       return;
     }
 
-    const rawNumber = parentDoc.whatsappNumber || parentDoc.phoneNumber;
+    // parentDoc may be { source, id, basic, phone }
+    const rawNumber = parentDoc.phone || parentDoc.basic?.whatsappNumber || parentDoc.basic?.phoneNumber || parentDoc.basic?.parentPhone || null;
     const phoneDigits = sanitizePhoneForWaMe(rawNumber);
     if (!phoneDigits) {
       toast({ title: 'رقم ولي الأمر غير متاح', description: 'لا يوجد رقم صالح محفوظ لهذا الطفل.', className: 'notification-error' });
@@ -404,17 +693,15 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       return;
     }
 
-    // إخفاء الأزرار فقط داخل الـ planRef (بدلاً من إخفاء كل أزرار الصفحة)
     const root = planRef.current;
     if (!root) return;
     const btns = root.querySelectorAll('button, a');
     btns.forEach(b => b.style.display = 'none');
 
     const oldDir = document.body.dir;
-    document.body.dir = 'rtl'; // للتأكد أن html2canvas يلتقط RTL بشكل سليم
+    document.body.dir = 'rtl';
 
     try {
-      // إعدادات html2canvas محسّنة: scale أعلى لدقة أفضل، background أبيض
       const canvas = await html2canvas(root, {
         scale: 3,
         useCORS: true,
@@ -422,7 +709,7 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
         backgroundColor: '#ffffff',
         logging: false,
         windowWidth: Math.max(document.documentElement.clientWidth, root.scrollWidth),
-        scrollY: -window.scrollY // لتجنب تأثير الـ viewport عند الاسكرول
+        scrollY: -window.scrollY
       });
 
       const imgData = canvas.toDataURL('image/png');
@@ -431,33 +718,26 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = pdf.internal.pageSize.getHeight();
 
-      // حساب أبعاد الصورة داخل صفحات الـ PDF (mm)
       const imgProps = pdf.getImageProperties(imgData);
       const imgRatio = imgProps.height / imgProps.width;
       const imgWidthInPdf = pdfWidth;
       const imgHeightInPdf = pdfWidth * imgRatio;
 
-      // إضافة الصورة الصفحة الأولى ثم قطع للصفحات التالية إن طالت المحتوى
       let heightLeft = imgHeightInPdf;
       let position = 0;
       pdf.addImage(imgData, 'PNG', 0, position, imgWidthInPdf, imgHeightInPdf);
       heightLeft -= pdfHeight;
 
-      while (heightLeft > -0.1) { // حلقة لإضافة صفحات إضافية
+      while (heightLeft > -0.1) {
         position = heightLeft - imgHeightInPdf;
         pdf.addPage();
         pdf.addImage(imgData, 'PNG', 0, position, imgWidthInPdf, imgHeightInPdf);
         heightLeft -= pdfHeight;
       }
 
-      // الآن نضيف footer / header (رقم الصفحة ومعلومات الختم) على كل صفحة
       const pageCount = pdf.internal.getNumberOfPages();
       for (let i = 1; i <= pageCount; i++) {
         pdf.setPage(i);
-        // footer: اسم النظام في اليسار (بـ mm)
-        pdf.setFontSize(9);
-        pdf.setTextColor(100);
-        // فقط رقم الصفحة بالإنجليزية (آمن)
         pdf.setFontSize(9);
         pdf.setTextColor(100);
         pdf.text(`Page ${i} / ${pageCount}`, pdfWidth / 2, pdfHeight - 8, { align: 'center' });
@@ -475,9 +755,6 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       btns.forEach(b => b.style.display = '');
     }
   };
-
-
-
 
   const handleAction = (action) => {
     if (action === 'save') return handleSaveSession();
@@ -589,11 +866,9 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
                 <div className="text-sm text-amber-700 bg-amber-50 p-2 rounded-md border border-amber-200">تعذر الحصول على تفاصيل الخطة.</div>
               );
 
-              // attach ref here so html2canvas captures exactly ما تريديه
               return (
                 <motion.div key="plan" ref={planRef} dir="rtl" style={{ textAlign: 'right' }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-4 text-sm bg-white p-4 rounded">
                   <div className="pdf-header flex items-center justify-between mb-4">
-                    {/* ضعّي الشعار في public/images/logo.png */}
                     <img src={siteLogo} alt="تِبيان" style={{ height: 56, objectFit: 'contain' }} />
                     <div style={{ textAlign: 'right' }}>
                       <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>نظام تِبيان</h2>
@@ -631,9 +906,9 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
   );
 };
 
-// استبدال التعريف القديم لـ PlanSection بهذا التعريف الجديد
+// PlanSection definition
 const PlanSection = ({ title, content, icon: Icon }) => (
-  <div className="plan-section"> {/* إضافة فئة مساعدة لو حبيت تضيف CSS خارجي */}
+  <div className="plan-section">
     <h4 className="font-semibold text-green-700 mb-3 flex items-center gap-2">
       {Icon && <Icon className="h-4 w-4" />}
       {title}
@@ -643,6 +918,5 @@ const PlanSection = ({ title, content, icon: Icon }) => (
     </div>
   </div>
 );
-
 
 export default EducationalPlan;

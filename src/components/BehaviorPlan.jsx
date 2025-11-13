@@ -1,5 +1,5 @@
 // src/components/BehaviorPlan.jsx
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ShieldCheck,
@@ -18,79 +18,85 @@ import { useToast } from '@/components/ui/use-toast';
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from '@/components/ui/label';
 import { db } from '@/lib/firebaseConfig';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
-// ------------------ Helpers for sanitizing large AI output ------------------
-const TRUNCATE_MAX = 2000; // max chars to keep for long strings
-const MAX_DOC_SIZE_BYTES = 900000; // safe margin under Firestore 1MiB limit
-
-function truncateString(s, n = TRUNCATE_MAX) {
-  if (typeof s !== 'string') return s;
-  return s.length > n ? s.slice(0, n) + '…(مقتطف)' : s;
-}
-
+// ---------- helpers ----------
+const TRUNCATE_MAX = 2000;
+function truncateString(s, n = TRUNCATE_MAX) { if (typeof s !== 'string') return s; return s.length > n ? s.slice(0, n) + '…(مقتطف)' : s; }
 function sanitizeValue(value, depth = 0, maxDepth = 4) {
   if (depth > maxDepth) return '[truncated-depth]';
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') return truncateString(value);
   if (typeof value === 'number' || typeof value === 'boolean') return value;
-  if (Array.isArray(value)) {
-    // limit array length
-    return value.slice(0, 200).map(v => sanitizeValue(v, depth + 1, maxDepth));
-  }
+  if (Array.isArray(value)) return value.slice(0, 200).map(v => sanitizeValue(v, depth + 1, maxDepth));
   if (typeof value === 'object') return sanitizeObject(value, depth + 1, maxDepth);
   return String(value);
 }
-
 function sanitizeObject(obj = {}, depth = 0, maxDepth = 4) {
   const blacklistKeys = ['raw_ai', 'binary', 'embeddings', 'embedding', 'full_text', 'data'];
   const sanitized = {};
   try {
     for (const [k, v] of Object.entries(obj)) {
       if (blacklistKeys.includes(k)) {
-        // keep a small excerpt if it's a string, otherwise mark removed
         if (typeof v === 'string') sanitized[k] = truncateString(v, 300);
         else sanitized[k] = '[removed-heavy]';
         continue;
       }
       sanitized[k] = sanitizeValue(v, depth, maxDepth);
     }
-  } catch (e) {
-    // defensive fallback
-    return { note: '[sanitization-failed]' };
-  }
+  } catch (e) { return { note: '[sanitization-failed]' }; }
   return sanitized;
 }
 
-function approximateByteSize(str) {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(str).length;
-  }
-  // naive fallback
-  return str.length;
+// ---------- deterministic id helpers ----------
+function slugifyForId(s) {
+  if (!s) return '';
+  return String(s)
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9\-_]/g, '')
+    .slice(0, 60);
+}
+function makeDeterministicId({ type = 'behavior_session', schoolId, teacherId, child, targetBehavior }) {
+  const school = slugifyForId(schoolId || 'noschool');
+  const teacher = slugifyForId(teacherId || 'noteacher');
+  const childSlug = slugifyForId(child || 'nochild');
+  const targetSlug = slugifyForId(targetBehavior || 'notarget');
+  return `${type}_${school}_${teacher}_${childSlug}_${targetSlug}`;
 }
 
-// ------------------ Component ------------------
+// ---------- UI constants ----------
 const steps = [
   { id: 1, name: 'نموذج السلوك', icon: FileText },
   { id: 2, name: 'تحليل ABC', icon: BarChart },
   { id: 3, name: 'توليد الخطة', icon: Lightbulb },
   { id: 4, name: 'قائمة التحقق', icon: CheckSquare },
 ];
-
 const fidelityChecklistItems = [
-  { id: 'c1', label: 'قدمتُ تهيئة بصرية للخطوات' },
+  { id: 'c1', label: 'قدمتُ تهيئة بصرية للالخطوات' },
   { id: 'c2', label: 'منحتُ اختيارين للطفل' },
   { id: 'c3', label: 'طبّقتُ التعزيز فوريًا بعد السلوك البديل' },
   { id: 'c4', label: 'سجّلتُ البيانات نهاية الجلسة' },
 ];
-
 const API_BASE = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ANALYZE_URL)
   ? import.meta.env.VITE_ANALYZE_URL
   : 'https://tebyan-backend.vercel.app/api/analyze';
 
-// --- (التعديل 1: إضافة teacherId إلى Props) ---
-const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTimer, userSchoolId, teacherId }) => {
+// ---------- Component ----------
+const BehaviorPlan = ({
+  currentChild,
+  onSaveToLog,
+  onAnalysisComplete,
+  sessionTimer,
+  userSchoolId,
+  teacherId,
+  existingSession = null,
+  initialStep = 1
+}) => {
+  const { toast } = useToast();
+
+  // core state
   const [currentStep, setCurrentStep] = useState(1);
   const [formData, setFormData] = useState({
     targetBehavior: '',
@@ -110,16 +116,49 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
   const [generatedPlan, setGeneratedPlan] = useState(null);
   const [checkedItems, setCheckedItems] = useState({});
   const [isSavingChecklist, setIsSavingChecklist] = useState(false);
-  const { toast } = useToast();
+  const [isSavingSession, setIsSavingSession] = useState(false);
 
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
-  };
+  // persisted ids for idempotency
+  const [savedSessionId, setSavedSessionId] = useState(existingSession?.id || null);
+  const [savedChecklistId, setSavedChecklistId] = useState(existingSession?.checklist?.id || null);
 
-  const nextStep = () => { if (currentStep < steps.length) setCurrentStep(currentStep + 1); };
-  const prevStep = () => { if (currentStep > 1) setCurrentStep(currentStep - 1); };
+  // refs
+  const mountedRef = useRef(true);
 
+  // populate from existingSession once
+  useEffect(() => {
+    mountedRef.current = true;
+    if (existingSession) {
+      console.log('[BehaviorPlan] mounting with existingSession', existingSession.id);
+      const ef = existingSession.formData || {};
+      setFormData(prev => ({
+        ...prev,
+        targetBehavior: ef.targetBehavior || ef.target_behavior || ef.behavior || prev.targetBehavior,
+        behaviorContext: ef.behaviorContext || ef.behavior_context || ef.activity || prev.behaviorContext,
+        severity: ef.severity || prev.severity,
+        previousAttempts: ef.previousAttempts || prev.previousAttempts,
+        cognitiveLevel: ef.cognitiveLevel || prev.cognitiveLevel,
+        behavioralLevel: ef.behavioralLevel || prev.behavioralLevel,
+        sensoryMotorLevel: ef.sensoryMotorLevel || prev.sensoryMotorLevel,
+        socialCommLevel: ef.socialCommLevel || prev.socialCommLevel,
+        antecedent: ef.antecedent || prev.antecedent,
+        behavior: ef.behavior || prev.behavior,
+        consequence: ef.consequence || prev.consequence,
+        hypothesizedFunction: ef.hypothesizedFunction || ef.hypothesized_function || prev.hypothesizedFunction,
+      }));
+      if (existingSession.generatedPlan) setGeneratedPlan(existingSession.generatedPlan);
+      if (existingSession.checklist && existingSession.checklist.checkedItems) setCheckedItems(existingSession.checklist.checkedItems);
+      if (existingSession.id) setSavedSessionId(existingSession.id);
+      if (existingSession.checklist?.id) setSavedChecklistId(existingSession.checklist.id);
+      if (initialStep && initialStep >= 1 && initialStep <= steps.length) setCurrentStep(initialStep);
+    } else {
+      if (initialStep && initialStep >= 1 && initialStep <= steps.length) setCurrentStep(initialStep);
+    }
+    return () => { mountedRef.current = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingSession, initialStep]);
+
+  // helpers
   const buildNoteText = () => [
     `Child: ${currentChild || 'غير محدد'}`,
     `Target behavior: ${formData.targetBehavior || 'غير محدد'}`,
@@ -133,13 +172,190 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
     `Child levels: cognitive=${formData.cognitiveLevel || '-'}, behavioral=${formData.behavioralLevel || '-'}, sensoryMotor=${formData.sensoryMotorLevel || '-'}, socialComm=${formData.socialCommLevel || '-'}`
   ].join('\n');
 
-  // ---- (بقية الدوال المساعدة كما هي) ----
+  const computeChecklistCompletion = (items) => {
+    const completed = Object.values(items || {}).filter(Boolean).length;
+    return { completed, total: fidelityChecklistItems.length, allComplete: completed === fidelityChecklistItems.length };
+  };
+
+  // NOTE: removed autosave-on-edit. saves only on explicit button clicks.
+
+  // ---------- Save session (explicit only) ----------
+  const handleSaveSession = async () => {
+    if (isSavingSession) return null;
+    if (!userSchoolId || !teacherId) {
+      toast({ title: "خطأ في الصلاحيات", description: "لا يمكن حفظ الجلسة بدون معرّف المدرسة والمعلمة.", className: "notification-error" });
+      return null;
+    }
+    setIsSavingSession(true);
+    try {
+      const sanitizedPlan = sanitizeObject(generatedPlan || {});
+      const sessionIdToUse = makeDeterministicId({
+        type: 'behavior_session',
+        schoolId: userSchoolId,
+        teacherId,
+        child: currentChild || formData.targetBehavior || 'nochild',
+        targetBehavior: formData.targetBehavior || 'notarget'
+      });
+      console.log('[BehaviorPlan] handleSaveSession -> upserting session id:', sessionIdToUse);
+
+      const docRef = doc(db, 'sessions', sessionIdToUse);
+      const payload = {
+        type: 'behavior_session',
+        child: currentChild || formData.targetBehavior || null,
+        text: sanitizedPlan.behavior_goal || formData.targetBehavior || 'جلسة سلوكية',
+        generatedPlan: sanitizedPlan,
+        formData: {
+          targetBehavior: formData.targetBehavior,
+          behaviorContext: formData.behaviorContext,
+          severity: formData.severity,
+          previousAttempts: formData.previousAttempts
+        },
+        meta: {
+          source: 'behavior-session-save',
+          savedAtLocal: new Date().toISOString(),
+          clientSessionId: sessionIdToUse
+        },
+        createdAt: serverTimestamp(),
+        schoolId: userSchoolId,
+        teacherId,
+        status: 'pending' // initial status
+      };
+
+      // persist once (upsert)
+      await setDoc(docRef, payload, { merge: true });
+      setSavedSessionId(sessionIdToUse);
+      console.log('[BehaviorPlan] session saved to Firestore (once):', sessionIdToUse);
+
+      // inform parent to update UI but DO NOT trigger parent to write to DB again.
+      if (typeof onSaveToLog === 'function') {
+        onSaveToLog({
+          id: sessionIdToUse,
+          timestamp: new Date().toISOString(),
+          child: payload.child,
+          text: payload.text,
+          activity: formData.behaviorContext || 'خطة سلوكية',
+          hasAudio: false,
+          energy: 3,
+          tags: ['behavior', 'session'],
+          type: 'behavior_session',
+          status: payload.status,
+          generatedPlan: payload.generatedPlan,
+          meta: payload.meta,
+          alreadySaved: true,
+          persist: false // IMPORTANT: tell App not to persist again
+        });
+      }
+
+      toast({ title: "تم حفظ الجلسة ✅", description: `تم حفظ الجلسة (id: ${sessionIdToUse}).`, className: "notification-success" });
+      return sessionIdToUse;
+    } catch (err) {
+      console.error('handleSaveSession error', err);
+      toast({ title: 'فشل حفظ الجلسة', description: err.message || 'حدث خطأ أثناء الحفظ.', className: 'notification-error' });
+      return null;
+    } finally {
+      setIsSavingSession(false);
+    }
+  };
+
+  // ---------- Save checklist (finalize) ----------
+  // IMPORTANT: Do NOT create a separate behavior_checklist document.
+  // Instead: update the existing behavior_session document (upsert) with checklist info only.
+  const handleSaveChecklist = async () => {
+    if (isSavingChecklist) return null;
+    if (!userSchoolId || !teacherId) {
+      toast({ title: "خطأ في الصلاحيات", description: "لا يمكن حفظ القائمة بدون معرّف المدرسة والمعلمة.", className: "notification-error" });
+      return null;
+    }
+
+    setIsSavingChecklist(true);
+    try {
+      const { completed, total, allComplete } = computeChecklistCompletion(checkedItems);
+      const fidelityScore = Math.round((completed / total) * 100);
+      const sanitizedPlan = sanitizeObject(generatedPlan || {});
+
+      // ensure there is a session doc to attach checklist to (deterministic id)
+      const sessionIdToUse = savedSessionId || makeDeterministicId({
+        type: 'behavior_session',
+        schoolId: userSchoolId,
+        teacherId,
+        child: currentChild || formData.targetBehavior || 'nochild',
+        targetBehavior: formData.targetBehavior || 'notarget'
+      });
+
+      console.log('[BehaviorPlan] handleSaveChecklist -> sessionIdToUse:', sessionIdToUse);
+
+      const sessionDocRef = doc(db, 'sessions', sessionIdToUse);
+
+      const checklistSummary = {
+        checkedItems,
+        fidelityScore,
+        totalItems: total,
+        completedItems: completed
+      };
+
+      // Merge checklist into parent session doc only (no separate checklist doc)
+      const sessionUpdatePayload = {
+        checklist: checklistSummary,
+        generatedPlan: sanitizedPlan,
+        meta: {
+          lastChecklistSummary: checklistSummary,
+          updatedByChecklistAt: new Date().toISOString()
+        },
+        status: allComplete ? 'applied' : 'pending',
+        updatedAt: serverTimestamp()
+      };
+
+      await setDoc(sessionDocRef, sessionUpdatePayload, { merge: true });
+      setSavedSessionId(sessionIdToUse);
+
+      console.log('[BehaviorPlan] parent session updated with checklist (no separate checklist doc):', sessionIdToUse);
+
+      // inform parent to update UI but DO NOT trigger parent to write to DB again
+      if (typeof onSaveToLog === 'function') {
+        onSaveToLog({
+          id: sessionIdToUse,
+          sessionId: sessionIdToUse,
+          timestamp: new Date().toISOString(),
+          child: currentChild || formData.targetBehavior || null,
+          text: `قائمة تحقق - ${formData.targetBehavior || '-'}`,
+          activity: formData.behaviorContext || 'خطة سلوكية',
+          hasAudio: false,
+          energy: Math.round(fidelityScore / 20),
+          tags: ['behavior', 'checklist', `fidelity-${fidelityScore}%`],
+          type: 'behavior_checklist', // kept type for UI, but persisted into parent session
+          status: allComplete ? 'applied' : 'pending',
+          generatedPlan: sanitizedPlan,
+          checklist: checklistSummary,
+          meta: {
+            source: 'behavior-checklist-merged-into-session',
+            savedAtLocal: new Date().toISOString(),
+            parentSessionId: sessionIdToUse
+          },
+          alreadySaved: true,
+          persist: false // IMPORTANT: prevent parent double-write
+        });
+      }
+
+      toast({
+        title: allComplete ? "تم تطبيق الخطة ✅" : "تم حفظ قائمة التحقق ✅",
+        description: allComplete ? "جميع العناصر مكتملة. الحالة: مُطبّق." : `تم الحفظ. درجة الالتزام: ${fidelityScore}%.`,
+        className: "notification-success"
+      });
+
+      return sessionIdToUse;
+    } catch (err) {
+      console.error('handleSaveChecklist error', err);
+      toast({ title: 'فشل حفظ قائمة التحقق', description: err.message || 'حدث خطأ أثناء الحفظ.', className: 'notification-error' });
+      return null;
+    } finally {
+      setIsSavingChecklist(false);
+    }
+  };
+
+  // ---------- Generate plan (does not auto-save) ----------
   const splitSentences = (text) => {
     if (!text || typeof text !== 'string') return [];
-    return text
-      .split(/[\.\!\?\n؛؛\:]+/)
-      .map(s => s.trim())
-      .filter(Boolean);
+    return text.split(/[\.\!\?\n؛؛\:]+/).map(s => s.trim()).filter(Boolean);
   };
   const collectStrings = (obj) => {
     const out = [];
@@ -152,29 +368,15 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
     walk(obj);
     return out;
   };
-  const containsKeyword = (s, keywords) => {
-    if (!s) return false;
-    const low = s.toLowerCase();
-    return keywords.some(k => low.includes(k));
-  };
-  const extractSentencesWithKeywords = (rawObj, keywords = []) => {
-    const strings = collectStrings(rawObj).map(String);
-    const sents = strings.flatMap(splitSentences);
-    const filtered = sents.filter(s => containsKeyword(s, keywords));
-    return Array.from(new Set(filtered.map(x => x.trim()))).filter(Boolean);
-  };
   const toArrayStrings = (v) => {
     if (!v && v !== 0) return [];
     if (Array.isArray(v)) return v.map(String).map(s => s.trim()).filter(Boolean);
     if (typeof v === 'string') return splitSentences(v);
     return [];
   };
-  // ---- (نهاية الدوال المساعدة) ----
-
 
   const handleGeneratePlan = async () => {
     setIsGenerating(true);
-
     const payload = {
       textNote: buildNoteText(),
       currentActivity: formData.behaviorContext || 'سلوكي',
@@ -191,69 +393,22 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`Server error ${res.status} ${text}`);
-      }
-
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
       const data = await res.json();
-
-      // (بقية كود التحليل كما هو)
       const normalized = data?.ai?.normalized || {};
       const raw = data?.ai?.raw || data?.ai || {};
       const behavior_goal = normalized.behavior_goal || normalized.smart_goal || normalized.summary || (typeof raw === 'string' ? raw : '') || '';
-      let antecedents = toArrayStrings(normalized.antecedents || normalized.antecedent || normalized.preceding || normalized.before);
-      let consequences = toArrayStrings(normalized.consequences || normalized.consequence || normalized.following || normalized.after);
-      const antecedent_strategies = toArrayStrings(normalized.antecedent_strategies || normalized.antecedentStrategies || normalized.prevention || normalized.proactive || normalized.prep || normalized.suggestions);
-      const consequence_strategies = toArrayStrings(normalized.consequence_strategies || normalized.consequenceStrategies || normalized.response_strategies || normalized.reactive || normalized.reinforcement || normalized.customizations);
-      let replacement_behavior = normalized.replacement_behavior || normalized.replacement || normalized.replacement_behavior || null;
-      if (!replacement_behavior) {
-        const repCandidates = extractSentencesWithKeywords(raw, ['سلوك بديل', 'بديل', 'replacement', 'مهارة', 'Skill', 'ask', 'طلب']);
-        if (repCandidates.length) {
-          replacement_behavior = { skill: repCandidates[0], modality: '' };
-        }
-      } else if (typeof replacement_behavior === 'string') {
-        const parts = replacement_behavior.split(/\||\-|\:/).map(p => p.trim()).filter(Boolean);
-        replacement_behavior = { skill: parts[0] || replacement_behavior, modality: parts[1] || '' };
-      } else {
-        replacement_behavior = {
-          skill: replacement_behavior.skill || replacement_behavior.name || replacement_behavior.label || '',
-          modality: replacement_behavior.modality || replacement_behavior.medium || ''
-        };
-      }
-      const antecedentKeywords = ['قبل', 'عند', 'أثناء', 'مسبق', 'قبل السلوك', 'عندما', 'حين'];
-      const consequenceKeywords = ['بعد', 'عقب', 'ينتج', 'نتيجة', 'يحصل', 'يحصل على', 'يؤدي إلى', 'ثم'];
-      if (!antecedents.length) antecedents = extractSentencesWithKeywords(raw, antecedentKeywords);
-      if (!consequences.length) consequences = extractSentencesWithKeywords(raw, consequenceKeywords);
-      if (!consequences.length && normalized.summary) {
-        const cand = splitSentences(normalized.summary).filter(s => containsKeyword(s, consequenceKeywords));
-        if (cand.length) consequences = cand;
-      }
-      antecedents = Array.from(new Set(antecedents.map(s => s.trim()).filter(Boolean))).filter(a => {
-        const goalText = (behavior_goal || '').trim();
-        return goalText ? a !== goalText : true;
-      });
-      consequences = Array.from(new Set(consequences.map(s => s.trim()).filter(Boolean)));
-      const antecedentStrategiesUnique = Array.from(new Set(antecedent_strategies.map(s => s.trim()).filter(Boolean)));
-      const consequenceStrategiesUnique = Array.from(new Set(consequence_strategies.map(s => s.trim()).filter(Boolean)));
-      const data_collection = normalized.data_collection || normalized.measurement || {};
-      const data_collection_safe = {
-        metric: data_collection.metric || data_collection.type || normalized.metric || '',
-        tool: data_collection.tool || data_collection.sheet || ''
-      };
+
       const safe = {
         type: normalized.type || 'behavioral',
-        behavior_goal: behavior_goal,
-        antecedents,
-        consequences,
-        function_analysis: normalized.function_analysis || normalized.behavior_function || normalized.hypothesized_function || formData.hypothesizedFunction || '',
-        behavior_interventions: normalized.behavior_interventions || [],
-        antecedent_strategies: antecedentStrategiesUnique,
-        consequence_strategies: consequenceStrategiesUnique,
-        replacement_behavior: replacement_behavior || { skill: '', modality: '' },
-        data_collection: data_collection_safe,
-        review_after_days: normalized.meta?.review_after_days || normalized.review_after_days || 14,
+        behavior_goal,
+        antecedents: toArrayStrings(normalized.antecedents || normalized.antecedent || []),
+        consequences: toArrayStrings(normalized.consequences || normalized.consequence || []),
+        antecedent_strategies: toArrayStrings(normalized.antecedent_strategies || normalized.prevention || []),
+        consequence_strategies: toArrayStrings(normalized.consequence_strategies || normalized.response_strategies || []),
+        replacement_behavior: normalized.replacement_behavior || {},
+        data_collection: normalized.data_collection || {},
+        review_after_days: normalized.meta?.review_after_days || 14,
         safety_flag: !!(normalized.meta?.safety_flag || normalized.safety_flag || (formData.severity === 'شديد')),
         raw_ai: raw,
         meta: normalized.meta || {}
@@ -264,8 +419,8 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
       setCurrentStep(3);
 
       const result = {
-        suggestions: normalized.suggestions || antecedentStrategiesUnique,
-        customizations: normalized.customizations || consequenceStrategiesUnique,
+        suggestions: normalized.suggestions || safe.antecedent_strategies,
+        customizations: normalized.customizations || safe.consequence_strategies,
         summary: normalized.summary || behavior_goal || '',
         noteData: {
           formData,
@@ -281,224 +436,51 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
       };
 
       if (typeof onAnalysisComplete === 'function') onAnalysisComplete(result);
-      if (typeof onSaveToLog === 'function') {
-        onSaveToLog({
-          text: result.summary,
-          hasAudio: false,
-          activity: formData.behaviorContext || '',
-          energy: 3,
-          tags: ['behavior'],
-          audioBlob: null,
-          type: 'analysis',
-          generatedPlan: safe
-        });
-      }
-
-      toast({ title: "تم إنشاء خطة السلوك من الخادم ✅", description: "استلمنا خطة سلوكية مُفصّلة.", className: "notification-success" });
-
+      toast({ title: "تم إنشاء خطة السلوك من الخادم ✅", description: "استلمنا خطة سلوكية مُفصّلة (محليًا). اضغطي حفظ لنشرها على الخادم.", className: "notification-success" });
     } catch (err) {
       console.error('handleGeneratePlan error', err);
-
-      // (بقية كود الـ fallback كما هو)
-      const mockBIP = {
-        antecedent_strategies: ["تقسيم المهمة إلى خطوات أصغر", "استخدام جدول بصري للأنشطة"],
-        replacement_behavior: { skill: "طلب استراحة باستخدام بطاقة", modality: "بطاقة" },
-        consequence_strategies: ["تعزيز فوري لطلب الاستراحة", "تجاهل مخطط لسلوك الرفض"],
-        data_collection: { metric: "تكرار", tool: "عداد بسيط لكل جلسة" },
-        review_after_days: 14,
-        safety_flag: formData.severity === 'شديد'
-      };
-      setGeneratedPlan(mockBIP);
       setIsGenerating(false);
-      setCurrentStep(3);
-      const resultMock = {
-        suggestions: mockBIP.antecedent_strategies || [],
-        customizations: mockBIP.consequence_strategies || [],
-        summary: `تم توليد خطة تدخل سلوكي (وضع افتراضي) للسلوك "${formData.targetBehavior || 'غير محدد'}".`,
-        noteData: {
-          formData,
-          generatedPlan: mockBIP,
-          child: currentChild,
-          sessionDuration: Math.round(sessionTimer?.time / 60 || 0),
-          type: 'analysis'
-        },
-        meta: { createdAt: new Date().toISOString(), source: 'behavior-plan-mock' }
-      };
-      if (typeof onAnalysisComplete === 'function') onAnalysisComplete(resultMock);
-      if (typeof onSaveToLog === 'function') {
-        onSaveToLog({
-          text: resultMock.summary,
-          hasAudio: false,
-          activity: formData.behaviorContext || '',
-          energy: 3,
-          tags: ['behavior'],
-          audioBlob: null,
-          type: 'analysis',
-          generatedPlan: mockBIP
-        });
-      }
-      toast({
-        title: "فشل الاتصال بالـ API — تم استخدام خطة افتراضية",
-        description: err.message || 'تحقق من الخادم.',
-        className: "notification-warning",
-        duration: 8000
-      });
+      toast({ title: "فشل الاتصال بالـ API — تم استخدام خطة افتراضية", description: err.message || 'تحقق من الخادم.', className: "notification-warning" });
     }
   };
 
-  const handleReferral = () => {
-    if (typeof onSaveToLog === 'function') {
-      onSaveToLog({
-        text: `إحالة لمختص بسبب سلوك: ${formData.targetBehavior || 'غير محدد'}`,
-        hasAudio: false,
-        activity: formData.behaviorContext || '',
-        energy: 0,
-        tags: ['referral'],
-        audioBlob: null,
-        type: 'referral'
-      });
-    }
-    toast({ title: "إحالة فورية لمختص 🚑", description: "تم تسجيل طلب الإحالة.", className: "notification-error", duration: 10000 });
-  };
-
-
-  // --- (التعديل 2: دالة الحفظ المعدلة) ---
-  const handleSaveChecklist = async () => {
-    setIsSavingChecklist(true);
-
-    // --- (التحقق من Props) ---
-    if (!userSchoolId || !teacherId) {
-      toast({
-        title: "خطأ في الصلاحيات",
-        description: "لا يمكن حفظ الجلسة بدون معرّف المدرسة والمعلمة.",
-        className: "notification-error"
-      });
-      setIsSavingChecklist(false); // (إضافة إيقاف التحميل عند الخطأ)
-      return null;
-    }
-
-    try {
-      const fidelityScore = (Object.values(checkedItems).filter(Boolean).length / fidelityChecklistItems.length) * 100;
-      let sanitizedPlan = sanitizeObject(generatedPlan || {});
-
-      let payload = {
-        type: 'behavior_checklist',
-        child: currentChild || formData.targetBehavior || null,
-        formData: {
-          targetBehavior: formData.targetBehavior,
-          behaviorContext: formData.behaviorContext,
-          severity: formData.severity
-        },
-        generatedPlan: sanitizedPlan,
-        checklist: {
-          checkedItems: checkedItems,
-          fidelityScore: Math.round(fidelityScore),
-          totalItems: fidelityChecklistItems.length,
-          completedItems: Object.values(checkedItems).filter(Boolean).length
-        },
-        meta: {
-          source: 'behavior-checklist',
-          savedAtLocal: new Date().toISOString()
-        },
-        createdAt: serverTimestamp(),
-        schoolId: userSchoolId, // <-- موجود
-        teacherId: teacherId    // <-- هذا هو التعديل
-      };
-
-      // (بقية كود التحقق من الحجم كما هو)
-      let jsonStr = JSON.stringify(payload);
-      let byteSize = approximateByteSize(jsonStr);
-      console.log('[saveChecklist] payload size bytes:', byteSize);
-
-      if (byteSize > MAX_DOC_SIZE_BYTES) {
-        console.warn('[saveChecklist] payload too large, removing raw_ai excerpt');
-        if (sanitizedPlan && sanitizedPlan.raw_ai) delete sanitizedPlan.raw_ai;
-        payload.generatedPlan = sanitizedPlan;
-        jsonStr = JSON.stringify(payload);
-        byteSize = approximateByteSize(jsonStr);
-        console.log('[saveChecklist] new payload size bytes:', byteSize);
-      }
-      if (byteSize > MAX_DOC_SIZE_BYTES) {
-        console.warn('[saveChecklist] payload still large — reducing to essentials');
-        sanitizedPlan = {
-          behavior_goal: sanitizedPlan.behavior_goal || '',
-          summary: (sanitizedPlan.meta && sanitizedPlan.meta.summary) || sanitizedPlan.summary || '',
-          antecedents: sanitizedPlan.antecedents || [],
-          consequences: sanitizedPlan.consequences || []
-        };
-        payload.generatedPlan = sanitizedPlan;
-        jsonStr = JSON.stringify(payload);
-        byteSize = approximateByteSize(jsonStr);
-        console.log('[saveChecklist] reduced payload size bytes:', byteSize);
-      }
-
-      let docRef;
-      try {
-        docRef = await addDoc(collection(db, 'sessions'), payload);
-      } catch (saveErr) {
-        console.error('[saveChecklist] addDoc failed:', saveErr);
-        try {
-          const minimalPayload = { ...payload, generatedPlan: { note: 'omitted-due-to-size' } };
-          docRef = await addDoc(collection(db, 'sessions'), minimalPayload);
-          console.warn('[saveChecklist] saved minimal payload due to error');
-        } catch (finalErr) {
-          console.error('[saveChecklist] final addDoc failed:', finalErr);
-          throw finalErr;
-        }
-      }
-
-      // (بقية كود onSaveToLog كما هو)
-      if (typeof onSaveToLog === 'function') {
-        onSaveToLog({
-          id: docRef.id,
-          timestamp: new Date().toISOString(),
-          child: currentChild || formData.targetBehavior || 'غير محدد',
-          text: `قائمة تحقق الخطة السلوكية - السلوك: ${formData.targetBehavior || 'غير محدد'} - درجة الالتزام: ${Math.round(fidelityScore)}%`,
-          activity: formData.behaviorContext || 'خطة سلوكية',
-          hasAudio: false,
-          energy: Math.round(fidelityScore / 20),
-          tags: ['behavior', 'checklist', `fidelity-${Math.round(fidelityScore)}%`],
-          type: 'behavior_checklist',
-          status: 'applied',
-          generatedPlan: sanitizedPlan,
-          checklist: {
-            checkedItems: checkedItems,
-            fidelityScore: Math.round(fidelityScore),
-            totalItems: fidelityChecklistItems.length,
-            completedItems: Object.values(checkedItems).filter(Boolean).length
-          },
-          suggestions: sanitizedPlan?.antecedent_strategies || sanitizedPlan?.suggestions || [],
-          customizations: sanitizedPlan?.consequence_strategies || sanitizedPlan?.customizations || []
-        });
-      }
-
-      toast({
-        title: "تم حفظ قائمة التحقق ✅",
-        description: `تم الحفظ بنجاح (id: ${docRef.id}). درجة الالتزام: ${Math.round(fidelityScore)}%. تم إضافة الجلسة إلى السجل.`,
-        className: "notification-success"
-      });
-
-      return docRef.id;
-    } catch (err) {
-      console.error('handleSaveChecklist error:', err);
-      toast({
-        title: 'فشل حفظ قائمة التحقق',
-        description: err.message || 'حدث خطأ أثناء الحفظ.',
-        className: 'notification-error'
-      });
-      return null;
-    } finally {
-      setIsSavingChecklist(false);
-    }
-  };
-  // --- (نهاية التعديل 2) ---
+  // ---------- UI rendering helpers ----------
+  const nextStep = () => { if (currentStep < steps.length) setCurrentStep(currentStep + 1); };
+  const prevStep = () => { if (currentStep > 1) setCurrentStep(currentStep - 1); };
 
   const renderStepContent = () => {
     switch (currentStep) {
-      case 1: return <Step1 formData={formData} handleInputChange={handleInputChange} />;
-      case 2: return <Step2 formData={formData} handleInputChange={handleInputChange} />;
-      case 3: return <Step3 isGenerating={isGenerating} generatedPlan={generatedPlan} onGenerate={handleGeneratePlan} onRefer={handleReferral} />;
-      case 4: return <Step4 checkedItems={checkedItems} setCheckedItems={setCheckedItems} />;
+      case 1: return <Step1 formData={formData} handleInputChange={(e) => setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }))} />;
+      case 2: return <Step2 formData={formData} handleInputChange={(e) => setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }))} />;
+      case 3: return (
+        <Step3
+          isGenerating={isGenerating}
+          generatedPlan={generatedPlan}
+          onGenerate={handleGeneratePlan}
+          onRefer={() => {
+            // referral immediate log (local only)
+            if (typeof onSaveToLog === 'function') {
+              onSaveToLog({
+                text: `إحالة لمختص بسبب سلوك: ${formData.targetBehavior || 'غير محدد'}`,
+                hasAudio: false,
+                activity: formData.behaviorContext || '',
+                energy: 0,
+                tags: ['referral'],
+                audioBlob: null,
+                type: 'referral',
+                alreadySaved: true,
+                persist: false
+              });
+            }
+            toast({ title: "إحالة فورية لمختص 🚑", description: "تم تسجيل طلب الإحالة محليًا.", className: "notification-error", duration: 10000 });
+          }}
+          onSaveSession={handleSaveSession}
+          isSavingSession={isSavingSession}
+          savedSessionId={savedSessionId}
+          onOpenChecklist={() => setCurrentStep(4)}
+        />
+      );
+      case 4: return <Step4 checkedItems={checkedItems} setCheckedItems={setCheckedItems} onSaveChecklist={handleSaveChecklist} />;
       default: return null;
     }
   };
@@ -531,29 +513,16 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
 
         <div className="flex justify-between mt-8 pt-6 border-t border-slate-200">
           <Button onClick={prevStep} disabled={currentStep === 1} variant="outline">
-            <ChevronLeft className="h-4 w-4 mr-2" />السابق
+            <ChevronLeft className="h-4 w-4 mr-2 rtl-flip" />السابق
           </Button>
           {currentStep < steps.length ? (
             <Button onClick={nextStep} disabled={currentStep === 3 && !generatedPlan}>
               التالي
-              <ChevronLeft className="h-4 w-4 ml-2 rtl-flip" />
+              <ChevronLeft className="h-4 w-4 ml-2 " />
             </Button>
           ) : (
-            <Button
-              onClick={handleSaveChecklist}
-              disabled={isSavingChecklist}
-            >
-              {isSavingChecklist ? (
-                <>
-                  <Loader2 className="h-4 w-4 ml-2 animate-spin" />
-                  جارٍ الحفظ...
-                </>
-              ) : (
-                <>
-                  <CheckSquare className="h-4 w-4 ml-2" />
-                  حفظ القائمة
-                </>
-              )}
+            <Button onClick={handleSaveChecklist} disabled={isSavingChecklist}>
+              {isSavingChecklist ? (<><Loader2 className="h-4 w-4 ml-2 animate-spin" />جارٍ الحفظ...</>) : (<><CheckSquare className="h-4 w-4 ml-2" />حفظ القائمة</>)}
             </Button>
           )}
         </div>
@@ -562,6 +531,7 @@ const BehaviorPlan = ({ currentChild, onSaveToLog, onAnalysisComplete, sessionTi
   );
 };
 
+/* ---------- Step subcomponents ---------- */
 
 const Step1 = ({ formData, handleInputChange }) => (
   <div className="space-y-6">
@@ -603,7 +573,7 @@ const Step2 = ({ formData, handleInputChange }) => (
   </div>
 );
 
-const Step3 = ({ isGenerating, generatedPlan, onGenerate, onRefer }) => (
+const Step3 = ({ isGenerating, generatedPlan, onGenerate, onRefer, onSaveSession, isSavingSession, savedSessionId, onOpenChecklist }) => (
   <div className="space-y-6">
     <h3 className="text-xl font-semibold text-slate-800">الخطوة 3: توليد الخطة</h3>
     {!generatedPlan && (
@@ -681,29 +651,36 @@ const Step3 = ({ isGenerating, generatedPlan, onGenerate, onRefer }) => (
             title="مراجعة الخطة"
             content={`تتم المراجعة بعد ${generatedPlan.review_after_days || 14} يومًا.`}
           />
+
+          <div className="flex flex-col sm:flex-row gap-3 mt-3 items-start">
+            <Button onClick={onSaveSession} disabled={isSavingSession} variant="outline">
+              {isSavingSession ? <Loader2 className="h-4 w-4 ml-2 animate-spin" /> : 'حفظ الجلسة في السجل'}
+            </Button>
+            <Button onClick={() => typeof onOpenChecklist === 'function' && onOpenChecklist()}>
+              فتح قائمة التحقق الآن
+            </Button>
+            {savedSessionId && (
+              <div className="text-sm text-slate-500 mt-2 sm:mt-0">
+                تم الحفظ (id: <span className="font-mono text-xs">{savedSessionId}</span>)
+              </div>
+            )}
+          </div>
         </motion.div>
       )}
     </AnimatePresence>
   </div>
 );
 
-const Step4 = ({ checkedItems, setCheckedItems }) => {
+const Step4 = ({ checkedItems, setCheckedItems, onSaveChecklist }) => {
   const fidelityScore = (Object.values(checkedItems).filter(Boolean).length / fidelityChecklistItems.length) * 100;
-
   return (
     <div className="space-y-6">
       <h3 className="text-xl font-semibold text-slate-800">الخطوة 4: قائمة تحقق التنفيذ</h3>
       <div className="space-y-3">
         {fidelityChecklistItems.map(item => (
           <div key={item.id} className="flex items-center space-x-2 space-x-reverse">
-            <Checkbox
-              id={item.id}
-              checked={checkedItems[item.id] || false}
-              onCheckedChange={(checked) => setCheckedItems(prev => ({ ...prev, [item.id]: checked }))}
-            />
-            <Label htmlFor={item.id} className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
-              {item.label}
-            </Label>
+            <Checkbox id={item.id} checked={checkedItems[item.id] || false} onCheckedChange={(checked) => setCheckedItems(prev => ({ ...prev, [item.id]: checked }))} />
+            <Label htmlFor={item.id} className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">{item.label}</Label>
           </div>
         ))}
       </div>
@@ -711,14 +688,13 @@ const Step4 = ({ checkedItems, setCheckedItems }) => {
         <h4 className="font-semibold">درجة الالتزام:</h4>
         <div className="flex items-center gap-3 mt-2">
           <div className="w-full bg-slate-200 rounded-full h-2.5">
-            <motion.div
-              className="bg-blue-500 h-2.5 rounded-full"
-              initial={{ width: 0 }}
-              animate={{ width: `${fidelityScore}%` }}
-              transition={{ duration: 0.5 }}
-            />
+            <motion.div className="bg-blue-500 h-2.5 rounded-full" initial={{ width: 0 }} animate={{ width: `${fidelityScore}%` }} transition={{ duration: 0.5 }} />
           </div>
           <span className="font-bold text-blue-600">{Math.round(fidelityScore)}%</span>
+        </div>
+
+        <div className="mt-4 flex gap-3">
+          <Button onClick={onSaveChecklist}><CheckSquare className="h-4 w-4 ml-2" />حفظ القائمة</Button>
         </div>
       </div>
     </div>
