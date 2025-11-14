@@ -13,12 +13,21 @@ import {
   CheckSquare,
   ShieldAlert
 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from '@/components/ui/label';
 import { db } from '@/lib/firebaseConfig';
-import { collection, doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  setDoc,
+  serverTimestamp,
+  query,
+  where,
+  limit,
+  onSnapshot
+} from 'firebase/firestore';
+import { Button } from './ui/button';
 
 // ---------- helpers ----------
 const TRUNCATE_MAX = 2000;
@@ -82,6 +91,129 @@ const fidelityChecklistItems = [
 const API_BASE = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ANALYZE_URL)
   ? import.meta.env.VITE_ANALYZE_URL
   : 'https://tebyan-backend.vercel.app/api/analyze';
+
+// ---------- small Firestore helpers for assessment lookup ----------
+
+// normalize Arabic name (trim, collapse spaces, remove tashkeel)
+const normalizeNameForSearch = (n) => {
+  if (!n) return '';
+  const removeDiacritics = (s) =>
+    s.replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]/g, '');
+  return removeDiacritics(String(n).trim()).replace(/\s+/g, ' ');
+};
+
+// recursively serialize Firestore values (Timestamp -> ISO)
+const serializeFirestoreData = (obj) => {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj.toDate === 'function') {
+    try { return obj.toDate().toISOString(); } catch (e) { return String(obj); }
+  }
+  if (Array.isArray(obj)) return obj.map(serializeFirestoreData);
+  if (typeof obj === 'object') {
+    const out = {};
+    for (const k of Object.keys(obj)) {
+      try { out[k] = serializeFirestoreData(obj[k]); } catch (e) { out[k] = String(obj[k]); }
+    }
+    return out;
+  }
+  return obj;
+};
+
+// tiny wrapper: run onSnapshot once and resolve with first snapshot (or null)
+const snapshotOnce = (q) => {
+  return new Promise((resolve) => {
+    let unsub = () => { };
+    try {
+      unsub = onSnapshot(q, (snap) => {
+        unsub();
+        if (!snap.empty) resolve(snap);
+        else resolve(null);
+      }, (err) => {
+        unsub();
+        console.warn('snapshotOnce error', err);
+        resolve(null);
+      });
+    } catch (e) {
+      try { unsub(); } catch { }
+      console.warn('snapshotOnce threw', e);
+      resolve(null);
+    }
+  });
+};
+
+// fetch assessment by child name with multiple fallbacks (client-side)
+const fetchAssessmentByChildNameClient = async (childNameToFind) => {
+  if (!childNameToFind || !String(childNameToFind).trim()) return null;
+  const raw = String(childNameToFind);
+  const nameTry = normalizeNameForSearch(raw);
+
+  try {
+    const col = collection(db, 'assessments');
+
+    // 1) try exact match on stored field (raw)
+    try {
+      const q1 = query(col, where('assessmentData.basicInfo.childName', '==', raw), limit(1));
+      const snap1 = await snapshotOnce(q1);
+      if (snap1 && !snap1.empty) {
+        const d = snap1.docs[0];
+        return { id: d.id, data: serializeFirestoreData(d.data()) };
+      }
+    } catch (e) { /* ignore */ }
+
+    // 2) try normalized exact
+    try {
+      const q2 = query(col, where('assessmentData.basicInfo.childName', '==', nameTry), limit(1));
+      const snap2 = await snapshotOnce(q2);
+      if (snap2 && !snap2.empty) {
+        const d = snap2.docs[0];
+        return { id: d.id, data: serializeFirestoreData(d.data()) };
+      }
+    } catch (e) { /* ignore */ }
+
+    // 3) prefix search (range)
+    try {
+      const start = nameTry;
+      const end = nameTry + '\uf8ff';
+      const q3 = query(col, where('assessmentData.basicInfo.childName', '>=', start), where('assessmentData.basicInfo.childName', '<=', end), limit(3));
+      const snap3 = await snapshotOnce(q3);
+      if (snap3 && !snap3.empty) {
+        const d = snap3.docs[0];
+        return { id: d.id, data: serializeFirestoreData(d.data()) };
+      }
+    } catch (e) { /* ignore */ }
+
+    // 4) small batch and client-side normalized compare
+    try {
+      const q4 = query(col, limit(20));
+      const snap4 = await snapshotOnce(q4);
+      if (snap4 && !snap4.empty) {
+        for (const d of snap4.docs) {
+          const data = d.data();
+          const stored = (data?.assessmentData?.basicInfo?.childName) || data?.childName || '';
+          if (normalizeNameForSearch(stored) === nameTry) {
+            return { id: d.id, data: serializeFirestoreData(data) };
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    // 5) fallback to 'children' collection (best-effort)
+    try {
+      const childrenCol = collection(db, 'children');
+      const q5 = query(childrenCol, where('name', '==', raw), limit(1));
+      const snap5 = await snapshotOnce(q5);
+      if (snap5 && !snap5.empty) {
+        const d = snap5.docs[0];
+        return { id: d.id, data: serializeFirestoreData(d.data()) };
+      }
+    } catch (e) { /* ignore */ }
+
+    return null;
+  } catch (err) {
+    console.error('fetchAssessmentByChildNameClient final error:', err);
+    return null;
+  }
+};
 
 // ---------- Component ----------
 const BehaviorPlan = ({
@@ -177,8 +309,6 @@ const BehaviorPlan = ({
     return { completed, total: fidelityChecklistItems.length, allComplete: completed === fidelityChecklistItems.length };
   };
 
-  // NOTE: removed autosave-on-edit. saves only on explicit button clicks.
-
   // ---------- Save session (explicit only) ----------
   const handleSaveSession = async () => {
     if (isSavingSession) return null;
@@ -258,8 +388,6 @@ const BehaviorPlan = ({
   };
 
   // ---------- Save checklist (finalize) ----------
-  // IMPORTANT: Do NOT create a separate behavior_checklist document.
-  // Instead: update the existing behavior_session document (upsert) with checklist info only.
   const handleSaveChecklist = async () => {
     if (isSavingChecklist) return null;
     if (!userSchoolId || !teacherId) {
@@ -377,6 +505,25 @@ const BehaviorPlan = ({
 
   const handleGeneratePlan = async () => {
     setIsGenerating(true);
+
+    // Attempt to fetch assessment/report data from Firestore to include in request (same pattern as EducationalPlan)
+    const lookupName = (currentChild && currentChild.trim()) || null;
+    let assessmentDoc = null;
+    if (lookupName) {
+      try {
+        toast({ title: 'جاري جلب بيانات الاستبيان/التقرير (إن وُجد)...', className: 'notification-info', duration: 2000 });
+        assessmentDoc = await fetchAssessmentByChildNameClient(lookupName);
+        if (assessmentDoc) {
+          console.log('[BehaviorPlan] found assessmentDoc:', assessmentDoc);
+          toast({ title: 'تم العثور على استبيان', description: `id: ${assessmentDoc.id}`, className: 'notification-success', duration: 2000 });
+        } else {
+          toast({ title: 'لا توجد استبيانات محفوظة لهذا الاسم', className: 'notification-warning', duration: 2000 });
+        }
+      } catch (e) {
+        console.warn('handleGeneratePlan: error fetching assessment', e);
+      }
+    }
+
     const payload = {
       textNote: buildNoteText(),
       currentActivity: formData.behaviorContext || 'سلوكي',
@@ -384,15 +531,38 @@ const BehaviorPlan = ({
       tags: ['behavior'],
       sessionDuration: Math.round(sessionTimer?.time / 60 || 0),
       curriculumQuery: formData.targetBehavior || '',
-      analysisType: 'behavior'
+      analysisType: 'behavior',
+      planRequestMeta: {
+        requestedByTeacherId: teacherId || null,
+        requestedBySchoolId: userSchoolId || null,
+        localTimestamp: new Date().toISOString(),
+        formDataSummary: {
+          targetBehavior: formData.targetBehavior,
+          antecedent: formData.antecedent,
+          behavior: formData.behavior,
+          consequence: formData.consequence
+        }
+      }
     };
+
+    if (assessmentDoc) {
+      payload.assessmentDoc = assessmentDoc; // { id, data }
+      payload.assessmentData = assessmentDoc.data.assessmentData || assessmentDoc.data || null;
+      payload.assessmentReport = assessmentDoc.data.report || assessmentDoc.data.familyReport || null;
+    }
+
+    // request with abort timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     try {
       const res = await fetch(API_BASE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       const data = await res.json();
       const normalized = data?.ai?.normalized || {};
@@ -435,10 +605,12 @@ const BehaviorPlan = ({
         }
       };
 
+      // callback to parent
       if (typeof onAnalysisComplete === 'function') onAnalysisComplete(result);
       toast({ title: "تم إنشاء خطة السلوك من الخادم ✅", description: "استلمنا خطة سلوكية مُفصّلة (محليًا). اضغطي حفظ لنشرها على الخادم.", className: "notification-success" });
     } catch (err) {
-      console.error('handleGeneratePlan error', err);
+      console.error('handleGeneratePlan error:', err);
+      clearTimeout(timeoutId);
       setIsGenerating(false);
       toast({ title: "فشل الاتصال بالـ API — تم استخدام خطة افتراضية", description: err.message || 'تحقق من الخادم.', className: "notification-warning" });
     }

@@ -1,13 +1,12 @@
-// FamilyReport.jsx (fixed: handle arrays of objects from AI -> avoid [object Object])
+// FamilyReport.jsx (updated — incorporate assessment details into AI payload + report)
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Users, Zap, FileText, Download, Send, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { useToast } from '@/components/ui/use-toast';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
+import toast, { Toaster } from 'react-hot-toast';
 
-// --- (التعديل 1: إضافة imports) ---
 import { db } from '@/lib/firebaseConfig';
 import {
   collection,
@@ -15,7 +14,6 @@ import {
   where,
   getDocs
 } from 'firebase/firestore';
-// --- (نهاية التعديل 1) ---
 
 const performanceMetrics = {
   independence: { label: 'الاستقلالية', options: ['يعتمد كليًا', 'مساعدة جزئية', 'بمفرده'], icon: '🙂' },
@@ -42,9 +40,28 @@ const FamilyReport = ({ data, currentChild }) => {
   const [isDownloading, setIsDownloading] = useState(false);
   const [generatedReport, setGeneratedReport] = useState(null);
   const reportRef = useRef(null);
-  const { toast } = useToast();
 
-  // Resolve endpoint (same logic as before)
+  // helper to show toast consistent with previous `className` usage
+  const showToast = ({ title = '', description = '', className = '', duration = 4000 }) => {
+    const message = description ? `${title}\n${description}` : title || description || '';
+    const lower = String(className || '').toLowerCase();
+    const opts = { duration };
+
+    if (lower.includes('success')) {
+      toast.success(message, opts);
+    } else if (lower.includes('error') || lower.includes('destructive')) {
+      toast.error(message, opts);
+    } else if (lower.includes('warning')) {
+      toast(message, { ...opts });
+    } else if (lower.includes('info')) {
+      toast(message, { ...opts });
+    } else {
+      // default neutral toast
+      toast(message, opts);
+    }
+  };
+
+  // Resolve endpoint
   const resolvedEndpoint = (() => {
     const e1 = import.meta.env.VITE_ANALYZE_URL;
     if (e1) return e1;
@@ -101,11 +118,9 @@ const FamilyReport = ({ data, currentChild }) => {
     if (typeof item === 'number' || typeof item === 'boolean') return String(item);
     if (Array.isArray(item)) return item.map(itemToString).join(' · ');
     if (typeof item === 'object') {
-      // prefer common fields
       if (item.name && item.type) return `${item.type}: ${item.name}`;
       if (item.name) return item.name;
       if (item.title) return item.title;
-      // fallback: stringify but keep concise
       try {
         return Object.entries(item).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`).slice(0, 5).join(' · ');
       } catch {
@@ -115,20 +130,109 @@ const FamilyReport = ({ data, currentChild }) => {
     return String(item);
   };
 
-  // --- (التعديل 2: إضافة دوال مساعدة للبحث والإرسال) ---
-  const findParentByChildName = async (childNameToFind) => {
+  // -----------------------------
+  // Assessment helpers
+  // -----------------------------
+  const findAssessmentByChildName = async (childNameToFind) => {
     try {
-      const q = query(collection(db, 'children'), where('childName', '==', childNameToFind));
-      const snap = await getDocs(q);
-      if (snap.empty) return null;
-      const doc0 = snap.docs[0];
-      return { id: doc0.id, ...doc0.data() };
+      const coll = collection(db, 'assessments');
+      let q = query(coll, where('assessmentData.basicInfo.childName', '==', childNameToFind));
+      let snap = await getDocs(q);
+      if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+
+      const fallbacks = [
+        'assessmentData.basicInfo.name',
+        'assessmentData.basicInfo.child',
+        'assessmentData.basicInfo.studentName',
+        'childName',
+        'basicInfo.childName',
+        'assessmentData.childName'
+      ];
+
+      for (const path of fallbacks) {
+        q = query(coll, where(path, '==', childNameToFind));
+        snap = await getDocs(q);
+        if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+      }
+
+      return null;
     } catch (err) {
-      console.error('findParentByChildName error:', err);
+      console.error('findAssessmentByChildName error:', err);
       return null;
     }
   };
 
+  // safely read nested path
+  const readPath = (obj, path) => {
+    if (!obj || !path) return undefined;
+    return path.split('.').reduce((acc, p) => (acc && Object.prototype.hasOwnProperty.call(acc, p) ? acc[p] : undefined), obj);
+  };
+
+  // extract phone
+  const extractPhoneRawFromAssessment = (assessmentDoc) => {
+    if (!assessmentDoc) return null;
+    const candidatePaths = [
+      'assessmentData.basicInfo.parent.whatsappNumber',
+      'assessmentData.basicInfo.parent.whatsapp',
+      'assessmentData.basicInfo.parentContact.whatsappNumber',
+      'assessmentData.basicInfo.parentContact.phone',
+      'assessmentData.basicInfo.whatsappNumber',
+      'assessmentData.basicInfo.phoneNumber',
+      'assessmentData.contact.whatsappNumber',
+      'assessmentData.contact.phoneNumber',
+      'parent.whatsappNumber',
+      'parent.phoneNumber',
+      'whatsappNumber',
+      'phoneNumber',
+    ];
+
+    for (const p of candidatePaths) {
+      const v = readPath(assessmentDoc, p);
+      if (v) return v;
+    }
+
+    if (assessmentDoc.whatsappNumber) return assessmentDoc.whatsappNumber;
+    if (assessmentDoc.phoneNumber) return assessmentDoc.phoneNumber;
+
+    return null;
+  };
+
+  // extract a summarized assessment snapshot (fields useful for AI)
+  const extractAssessmentSnapshot = (assessmentDoc) => {
+    if (!assessmentDoc) return null;
+    const basic = readPath(assessmentDoc, 'assessmentData.basicInfo') || {};
+    const diagnosis = readPath(assessmentDoc, 'assessmentData.diagnosis') || readPath(assessmentDoc, 'diagnosis') || null;
+    const initialRatings = readPath(assessmentDoc, 'assessmentData.initialRatings') || readPath(assessmentDoc, 'initialRatings') || {};
+    const goals = readPath(assessmentDoc, 'assessmentData.goals') || readPath(assessmentDoc, 'goals') || null;
+    const notes = readPath(assessmentDoc, 'assessmentData.notes') || assessmentDoc.notes || null;
+    const recentSessions = readPath(assessmentDoc, 'assessmentData.recentSessions') || readPath(assessmentDoc, 'recentSessions') || null;
+
+    // normalize ratings to keys we expect when possible
+    const normalizedRatings = {};
+    Object.keys(initialRatings || {}).forEach(k => {
+      const keyLower = k.toLowerCase().replace(/\s+/g, '_');
+      if (performanceMetrics[keyLower]) {
+        normalizedRatings[keyLower] = initialRatings[k];
+      } else {
+        // try matching by label
+        const found = Object.keys(performanceMetrics).find(pk => performanceMetrics[pk].label === k || pk === k);
+        if (found) normalizedRatings[found] = initialRatings[k];
+      }
+    });
+
+    return {
+      basicInfo: basic,
+      diagnosis,
+      initialRatings: normalizedRatings,
+      goals,
+      notes,
+      recentSessions
+    };
+  };
+
+  // -----------------------------
+  // phone utilities / WA helper
+  // -----------------------------
   const sanitizePhoneForWaMe = (raw) => {
     if (!raw) return null;
     const digits = raw.replace(/\D/g, '');
@@ -143,27 +247,35 @@ const FamilyReport = ({ data, currentChild }) => {
     if (!win) window.location.href = url;
   };
 
-  // --- (التعديل 3: استبدال دالة إنشاء الرسالة بالكامل) ---
-  const composeFamilyReportMessage = ({ childName, reportObj }) => {
+  // -----------------------------
+  // compose message (now includes a short assessment summary if available)
+  // -----------------------------
+  const composeFamilyReportMessage = ({ childName, reportObj, assessmentSnapshot = null }) => {
     const name = childName || 'الطفل';
     const period = reportObj.period || 'الفترة الحالية';
     const date = new Date(reportObj.generatedAt || Date.now()).toLocaleDateString('ar-SA');
 
-    // تجميع كل التقييمات كنص
-    const ratingsText = Object.entries(reportObj.ratings)
+    const ratingsText = Object.entries(reportObj.ratings || {})
       .map(([key, value]) => {
         const label = performanceMetrics[key]?.label || key;
         return `• *${label}:* ${value}`;
       })
       .join('\n');
 
-    // تجميع كل أقسام التقرير
     const goals = reportObj.targets ? `\n\n*🎯 الأهداف التي عملنا عليها:*\n${reportObj.targets}` : '';
     const performance = `\n\n*📊 ملخص الأداء:*\n${ratingsText}`;
     const notes = reportObj.notes ? `\n\n*📝 ملاحظات المعلمة:*\n${reportObj.notes}` : '';
     const home = reportObj.home_activities ? `\n\n*🏠 أنشطة منزلية مقترحة:*\n${reportObj.home_activities}` : '';
 
-    // الرسالة الكاملة
+    // brief assessment snapshot (if available)
+    let assessmentText = '';
+    if (assessmentSnapshot) {
+      const age = assessmentSnapshot.basicInfo?.age || assessmentSnapshot.basicInfo?.dob || '';
+      const diag = assessmentSnapshot.diagnosis ? `\n*تشخيص/ملاحظات طبية:* ${itemToString(assessmentSnapshot.diagnosis)}` : '';
+      const asGoals = assessmentSnapshot.goals ? `\n*أهداف سابقة:* ${itemToString(assessmentSnapshot.goals)}` : '';
+      assessmentText = `\n\n*ℹ️ معلومات التقييم:*${age ? `\n- العمر/تاريخ الميلاد: ${age}` : ''}${diag}${asGoals}`;
+    }
+
     return `*— تقرير تِبيان للأسرة —*
 السلام عليكم ورحمة الله،
 
@@ -174,21 +286,26 @@ ${goals}
 ${performance}
 ${notes}
 ${home}
+${assessmentText}
 
 نشكر لكم تعاونكم المستمر،
 *منصة تِبيان للتعليم*`;
   };
-  // --- (نهاية التعديل 3) ---
 
+  // -----------------------------
+  // MAIN: generate report (now merges assessment details into payload)
+  // -----------------------------
+  // -----------------------------
+  // MAIN: generate report (now merges assessment details into payload)
+  // -----------------------------
   const handleGenerateReport = async () => {
-    
     if (!formData.targets || formData.targets.trim() === '') {
-      toast({
+      showToast({
         title: "حقل مطلوب",
         description: "يرجى إدخال (الأهداف المجدولة) أولاً قبل توليد التقرير.",
         className: "notification-warning"
       });
-      return; 
+      return;
     }
 
     setIsGenerating(true);
@@ -196,16 +313,62 @@ ${home}
     const timeout = setTimeout(() => controller.abort(), 30000);
 
     try {
+      // 1) try to load assessment for the child (if currentChild set)
+      let assessmentDoc = null;
+      let assessmentSnapshot = null;
+      if (currentChild && currentChild.trim() !== '') {
+        assessmentDoc = await findAssessmentByChildName(currentChild);
+        if (assessmentDoc) {
+          assessmentSnapshot = extractAssessmentSnapshot(assessmentDoc);
+          // If form fields empty, prefill from assessment where sensible
+          if ((!formData.targets || formData.targets.trim() === '') && assessmentSnapshot.goals) {
+            setFormData(prev => ({ ...prev, targets: itemToString(assessmentSnapshot.goals) }));
+          }
+          if (assessmentSnapshot.initialRatings && Object.keys(assessmentSnapshot.initialRatings).length > 0) {
+            // merge initial ratings with current formData ratings (prefer user-entered)
+            setFormData(prev => ({ ...prev, ratings: { ...prev.ratings, ...assessmentSnapshot.initialRatings } }));
+          }
+        }
+      }
+
+      // 2) build payload and include assessment snapshot + raw doc fields if present
+      // Prepare fields for backend (n8n) consumption
+      let assessmentDocForPayload = null;
+      let assessmentDataForPayload = null;
+      let assessmentReportForPayload = null;
+
+      if (assessmentDoc) {
+        // ensure we send an object shaped { id, data } (the analyze route supports both)
+        assessmentDocForPayload = { id: assessmentDoc.id || assessmentDoc.docId || null, data: assessmentDoc };
+        // also send a direct 'data' fallback (some codepaths expect plain object)
+        assessmentDataForPayload = assessmentDoc;
+        // try common report paths
+        assessmentReportForPayload = assessmentDoc.report || (assessmentDoc.assessmentData && assessmentDoc.assessmentData.report) || null;
+      }
+
       const payload = {
         textNote: buildNoteText(),
         currentActivity: 'تقرير أسري',
         energyLevel: 3,
         tags: ['family-report'],
         sessionDuration: 0,
-        curriculumQuery: formData.targets || ''
+        curriculumQuery: formData.targets || '',
+        // keep the local snapshot (useful for client-side UI)
+        assessment: assessmentSnapshot ? assessmentSnapshot : null,
+        // === new: raw assessment objects for backend/n8n/model context ===
+        assessmentDoc: assessmentDocForPayload,
+        assessmentData: assessmentDataForPayload,
+        assessmentReport: assessmentReportForPayload,
+        // include child name + metadata about this request
+        childName: currentChild || null,
+        planRequestMeta: {
+          requestedFrom: 'family_report_ui',
+          formData: { ...formData },
+          requestedAt: new Date().toISOString()
+        }
       };
 
-      toast({ title: 'جاري طلب تحليل AI...', description: `endpoint: ${resolvedEndpoint}`, className: 'notification-info' });
+      showToast({ title: 'جاري طلب تحليل AI...', description: `endpoint: ${resolvedEndpoint}`, className: 'notification-info', duration: 5000 });
 
       const res = await fetch(resolvedEndpoint, {
         method: 'POST',
@@ -227,14 +390,12 @@ ${home}
       const meta = json?.meta || {};
       const normalized = ai.normalized || ai;
 
-      // safe extraction + convert arrays of objects to readable strings
       const aiTargetsRaw = normalized.smart_goal || normalized.targets || normalized.goal || formData.targets;
       const aiTargets = Array.isArray(aiTargetsRaw) ? aiTargetsRaw.map(itemToString).join('\n') : (typeof aiTargetsRaw === 'string' ? aiTargetsRaw : itemToString(aiTargetsRaw));
 
       const aiNotes = normalized.summary || normalized.notes || normalized.analysis || formData.notes;
 
       const aiHomeRaw = normalized.home_activities || normalized.recommendations || normalized.activities || formData.home_activities;
-      // aiHomeRaw may be array of strings or objects -> map to readable lines
       let aiHomeStr = '';
       if (Array.isArray(aiHomeRaw)) {
         aiHomeStr = aiHomeRaw.map(itemToString).join('\n');
@@ -247,6 +408,7 @@ ${home}
       const aiRatingsRaw = normalized.ratings || normalized.metrics || ai.ratings || {};
       const mergedRatings = mapAiRatingsToKeys(aiRatingsRaw);
 
+      // 3) include assessment snapshot inside the generatedReport so UI / send can use it
       const newReport = {
         ...formData,
         targets: aiTargets,
@@ -255,15 +417,21 @@ ${home}
         ratings: mergedRatings,
         generatedAt: normalized.generatedAt || normalized.date || meta.sentAt || new Date().toISOString(),
         aiRaw: ai,
-        meta
+        meta,
+        // keep the snapshot for UI (unchanged)
+        assessmentSnapshot,
+        // also attach the raw doc info returned from DB (so other UI code can use phone, ids, etc.)
+        assessmentDoc: assessmentDocForPayload,
+        assessmentData: assessmentDataForPayload,
+        assessmentReport: assessmentReportForPayload
       };
 
       setGeneratedReport(newReport);
-      toast({ title: 'انتهى التحليل', description: 'تم إنشاء معاينة للتقرير', className: 'notification-success' });
+      showToast({ title: 'انتهى التحليل', description: 'تم إنشاء معاينة للتقرير مع أخذ بيانات التقييم بعين الاعتبار', className: 'notification-success' });
     } catch (err) {
       console.error('handleGenerateReport error', err);
       setGeneratedReport({ ...formData, generatedAt: new Date().toISOString(), aiRaw: null });
-      toast({ title: 'فشل في تحليل AI — استخدام البيانات الحالية', description: String(err?.message || err), className: 'notification-error', duration: 8000 });
+      showToast({ title: 'فشل في تحليل AI — استخدام البيانات الحالية', description: String(err?.message || err), className: 'notification-error', duration: 8000 });
     } finally {
       clearTimeout(timeout);
       setIsGenerating(false);
@@ -273,12 +441,12 @@ ${home}
 
   const handleDownloadPdf = async () => {
     if (!generatedReport || !reportRef.current) {
-      toast({ title: 'لا يوجد تقرير للتصدير', className: 'notification-warning' });
+      showToast({ title: 'لا يوجد تقرير للتصدير', className: 'notification-warning' });
       return;
     }
 
     setIsDownloading(true);
-    toast({ title: 'جاري تجهيز PDF...', className: 'notification-info' });
+    showToast({ title: 'جاري تجهيز PDF...', className: 'notification-info' });
 
     try {
       const wrapper = document.createElement('div');
@@ -329,29 +497,27 @@ ${home}
       pdf.save(filename);
 
       document.body.removeChild(wrapper);
-      toast({ title: 'تم تنزيل PDF', description: filename, className: 'notification-success' });
+      showToast({ title: 'تم تنزيل PDF', description: filename, className: 'notification-success' });
     } catch (err) {
       console.error('download pdf error', err);
-      toast({ title: 'فشل تجهيز PDF', description: String(err?.message || err), className: 'notification-error' });
+      showToast({ title: 'فشل تجهيز PDF', description: String(err?.message || err), className: 'notification-error' });
     } finally {
       setIsDownloading(false);
     }
   };
 
   const handleSend = async () => {
-    // 1. التحقق من اختيار الطفل
     if (!currentChild || currentChild.trim() === '') {
-      toast({
+      showToast({
         title: "لم يتم اختيار الطفل",
         description: "يرجى اختيار الطفل من القائمة العلوية أولاً قبل الإرسال.",
         className: "notification-warning"
       });
-      return; 
+      return;
     }
 
-    // 2. التحقق من وجود تقرير مُولّد
     if (!generatedReport) {
-      toast({
+      showToast({
         title: "لا يوجد تقرير للإرسال",
         description: "يرجى 'توليد التقرير' أولاً.",
         className: "notification-warning"
@@ -359,37 +525,37 @@ ${home}
       return;
     }
 
-    // 3. البحث عن ولي الأمر
-    toast({ title: 'جاري البحث عن ولي الأمر...', className: 'notification-info', duration: 2000 });
-    const parentDoc = await findParentByChildName(currentChild);
+    showToast({ title: 'جاري البحث عن ولي الأمر...', className: 'notification-info', duration: 2000 });
+    const parentDoc = await findAssessmentByChildName(currentChild);
     if (!parentDoc) {
-      toast({ title: 'لم نعثر على ولي أمر', description: `لا توجد بيانات لاسم "${currentChild}" في قاعدة البيانات.`, className: 'notification-error', duration: 8000 });
+      showToast({ title: 'لم نعثر على ولي أمر', description: `لا توجد بيانات لاسم "${currentChild}" في قاعدة البيانات.`, className: 'notification-error', duration: 8000 });
       return;
     }
 
-    // 4. جلب رقم الواتساب
-    const rawNumber = parentDoc.whatsappNumber || parentDoc.phoneNumber;
-    const phoneDigits = sanitizePhoneForWaMe(rawNumber);
+    const rawNumberFromDoc = extractPhoneRawFromAssessment(parentDoc);
+    const phoneDigits = sanitizePhoneForWaMe(rawNumberFromDoc || parentDoc.whatsappNumber || parentDoc.phoneNumber);
     if (!phoneDigits) {
-      toast({ title: 'رقم ولي الأمر غير متاح', description: 'لا يوجد رقم صالح محفوظ لهذا الطفل.', className: 'notification-error' });
+      showToast({ title: 'رقم ولي الأمر غير متاح', description: 'لا يوجد رقم صالح محفوظ لهذا الطفل.', className: 'notification-error' });
       return;
     }
 
-    // 5. إنشاء الرسالة (نستخدم الدالة الجديدة)
-    const message = composeFamilyReportMessage({ childName: currentChild, reportObj: generatedReport });
+    // include assessment snapshot in message if present
+    const assessmentSnapshot = extractAssessmentSnapshot(parentDoc);
+    const message = composeFamilyReportMessage({ childName: currentChild, reportObj: generatedReport, assessmentSnapshot });
 
-    // 6. فتح واتساب
     try {
       openWhatsAppChat(phoneDigits, message);
-      toast({ title: 'تم فتح دردشة واتساب', description: 'يرجى الضغط على "إرسال" لإيصال الرسالة لولي الأمر.', className: 'notification-success', duration: 8000 });
+      showToast({ title: 'تم فتح دردشة واتساب', description: 'يرجى الضغط على "إرسال" لإيصال الرسالة لولي الأمر.', className: 'notification-success', duration: 8000 });
     } catch (err) {
       console.error('openWhatsAppChat error:', err);
-      toast({ title: 'فشل فتح واتساب', description: err.message || 'تحقق من صحة الرقم أو إعدادات المتصفح.', className: 'notification-error' });
+      showToast({ title: 'فشل فتح واتساب', description: err.message || 'تحقق من صحة الرقم أو إعدادات المتصفح.', className: 'notification-error' });
     }
   };
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
+      <Toaster position="top-right" />
+
       <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-gradient-to-r from-purple-500 to-purple-600 rounded-xl p-6 text-white">
         <div className="flex items-center gap-3 mb-2">
           <Users className="h-6 w-6" />
@@ -457,6 +623,16 @@ ${home}
                     <ReportSection title="الأهداف خلال الفترة" content={generatedReport.targets} />
                     <ReportSection title="ملاحظات المعلمة" content={generatedReport.notes} />
                     <ReportSection title="أنشطة منزلية مقترحة" content={generatedReport.home_activities} />
+
+                    {generatedReport.assessmentSnapshot && (
+                      <ReportSection title="مُلخّص التقييم (من نظام التقييم)">
+                        <div className="text-sm text-slate-600 space-y-2">
+                          <div><strong>معلومات أساسية:</strong> {itemToString(generatedReport.assessmentSnapshot.basicInfo)}</div>
+                          {generatedReport.assessmentSnapshot.diagnosis && <div><strong>تشخيص/ملاحظات:</strong> {itemToString(generatedReport.assessmentSnapshot.diagnosis)}</div>}
+                          {generatedReport.assessmentSnapshot.goals && <div><strong>أهداف سابقة:</strong> {itemToString(generatedReport.assessmentSnapshot.goals)}</div>}
+                        </div>
+                      </ReportSection>
+                    )}
 
                     {generatedReport.aiRaw && generatedReport.aiRaw.normalized && (
                       <ReportSection title="خطة مُولّدة (مقتطف)">

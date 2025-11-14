@@ -1,3 +1,4 @@
+// src/contexts/AuthContext.jsx
 import React, { createContext, useContext, useEffect, useState } from "react";
 import app from "../lib/firebaseConfig";
 import {
@@ -19,53 +20,92 @@ export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(null);
   const [userRole, setUserRole] = useState(null);
   const [userSchoolId, setUserSchoolId] = useState(null);
-  const [loading, setLoading] = useState(true);
+
+  // initializing === true أثناء انتظار أول callback من onAuthStateChanged
+  const [initializing, setInitializing] = useState(true);
+
+  // loading === true أثناء تنفيذ login/logout (نشاطات متفرقة)
+  const [loading, setLoading] = useState(false);
+
+  // خطأ عام للعرض
   const [error, setError] = useState(null);
+
+  // حالة صريحة للمستخدم غير مخول (يوجد حساب لكن بلا دور أو بدون صلاحية)
+  const [unauthorized, setUnauthorized] = useState(false);
 
   const auth = getAuth(app);
 
   useEffect(() => {
-    setLoading(true);
+    let mounted = true;
+    setInitializing(true);
+
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!mounted) return;
       setCurrentUser(user);
       setError(null);
+      setUnauthorized(false);
+
       if (!user) {
         setUserRole(null);
         setUserSchoolId(null);
-        setLoading(false);
+        if (mounted) setInitializing(false);
         return;
       }
+
       try {
         const userDocRef = doc(db, "users", user.uid);
         const userDoc = await getDoc(userDocRef);
+
+        if (!mounted) return;
+
         if (userDoc.exists()) {
           const data = userDoc.data();
-          setUserRole(data.role);
-          setUserSchoolId(data.schoolId);
+          setUserRole(data.role || null);
+          setUserSchoolId(data.schoolId || null);
+          setUnauthorized(false);
         } else {
+          // لا نوقّع الخروج تلقائياً — نضع العلم unauthorized فقط
           setUserRole(null);
           setUserSchoolId(null);
-          setError("هذا المستخدم لا يملك صلاحيات، الرجاء مراجعة الإدارة.");
-          await signOut(auth);
+          setError("هذا المستخدم لا يملك صلاحيات (لم يُعثر على مستند المستخدم). الرجاء مراجعة الإدارة.");
+          setUnauthorized(true);
+          // لا تقم بعمل signOut هنا لتجنب حلقات ال login/logout
         }
       } catch (e) {
-        setError("فشل في جلب بيانات الصلاحيات: " + e.message);
-        setUserRole(null);
-        setUserSchoolId(null);
-        await signOut(auth);
+        // تجاهل أخطاء الإلغاء لأنها تحدث أثناء cleanup أحيانًا
+        if (e && (e.name === 'AbortError' || (e.message && e.message.toLowerCase().includes('aborted')))) {
+          console.warn('Firestore request aborted (ignored).', e);
+          // لا نغيّر حالة المستخدم هنا
+        } else {
+          console.error('Error fetching user doc for auth state:', e);
+          setError("فشل في جلب بيانات الصلاحيات: " + (e.message || e));
+          setUserRole(null);
+          setUserSchoolId(null);
+          // بدل signOut: نضع unauthorized لعرض رسالة للمسؤولين
+          setUnauthorized(true);
+          // لا نوقّع الخروج تلقائياً هنا
+        }
       } finally {
-        setLoading(false);
+        if (mounted) setInitializing(false);
       }
     });
-    return () => unsubscribe();
-    // eslint-disable-next-line
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // login يعيد userCredential حتى الصفحات تقدر تستعمل uid فورا
   const login = async (email, password) => {
     setLoading(true);
     setError(null);
     try {
-      await signInWithEmailAndPassword(auth, email, password);
+      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+      // reset unauthorized flag on explicit login attempt
+      setUnauthorized(false);
+      return userCredential;
     } catch (e) {
       setError("فشل تسجيل الدخول: " + (e.message || "حدث خطأ غير معروف"));
       throw e;
@@ -79,8 +119,13 @@ export function AuthProvider({ children }) {
     setError(null);
     try {
       await signOut(auth);
+      // reset states
+      setUserRole(null);
+      setUserSchoolId(null);
+      setUnauthorized(false);
     } catch (e) {
       setError("فشل تسجيل الخروج: " + (e.message || "حدث خطأ غير معروف"));
+      console.warn("logout failed", e);
     } finally {
       setLoading(false);
     }
@@ -92,10 +137,12 @@ export function AuthProvider({ children }) {
         currentUser,
         userRole,
         userSchoolId,
+        initializing,
         login,
         logout,
         loading,
-        error
+        error,
+        unauthorized
       }}
     >
       {children}
