@@ -252,7 +252,8 @@ const BehaviorPlan = ({
 
   // persisted ids for idempotency
   const [savedSessionId, setSavedSessionId] = useState(existingSession?.id || null);
-  const [savedChecklistId, setSavedChecklistId] = useState(existingSession?.checklist?.id || null);
+  // keep savedChecklistId null by default to avoid accidental auto-merge; will be set only if checklist belongs to current teacher
+  const [savedChecklistId, setSavedChecklistId] = useState(null);
 
   // refs
   const mountedRef = useRef(true);
@@ -279,9 +280,45 @@ const BehaviorPlan = ({
         hypothesizedFunction: ef.hypothesizedFunction || ef.hypothesized_function || prev.hypothesizedFunction,
       }));
       if (existingSession.generatedPlan) setGeneratedPlan(existingSession.generatedPlan);
-      if (existingSession.checklist && existingSession.checklist.checkedItems) setCheckedItems(existingSession.checklist.checkedItems);
+
+      // NEW: populate checklist only if the checklist was saved by the current teacher
+      const checklist = existingSession.checklist || null;
+      if (checklist && checklist.checkedItems && Object.keys(checklist.checkedItems).length) {
+        // possible places where owner info might live
+        const savedByCandidate =
+          checklist.savedBy ||
+          checklist.owner ||
+          checklist.meta?.savedBy ||
+          checklist.meta?.ownerId ||
+          existingSession.teacherId ||
+          existingSession.meta?.teacherId ||
+          existingSession.meta?.savedBy ||
+          null;
+
+        const matchesCurrentUser = savedByCandidate ? String(savedByCandidate) === String(teacherId) : false;
+
+        if (matchesCurrentUser) {
+          // normalize values to booleans
+          const normalized = {};
+          for (const [k, v] of Object.entries(checklist.checkedItems || {})) {
+            normalized[k] = !!v;
+          }
+          setCheckedItems(normalized);
+          if (checklist.id) setSavedChecklistId(checklist.id);
+          console.log('[BehaviorPlan] loaded checklist from existingSession (owned by current teacher).');
+        } else {
+          // do NOT auto-populate checked items from someone else — keep empty
+          setCheckedItems({});
+          setSavedChecklistId(null);
+          console.log('[BehaviorPlan] existing checklist belongs to another user — not auto-loading checked items.');
+        }
+      } else {
+        // no checklist present
+        setCheckedItems({});
+        setSavedChecklistId(null);
+      }
+
       if (existingSession.id) setSavedSessionId(existingSession.id);
-      if (existingSession.checklist?.id) setSavedChecklistId(existingSession.checklist.id);
       if (initialStep && initialStep >= 1 && initialStep <= steps.length) setCurrentStep(initialStep);
     } else {
       if (initialStep && initialStep >= 1 && initialStep <= steps.length) setCurrentStep(initialStep);
@@ -418,7 +455,10 @@ const BehaviorPlan = ({
         checkedItems,
         fidelityScore,
         totalItems: total,
-        completedItems: completed
+        completedItems: completed,
+        // record who saved the checklist
+        savedBy: teacherId,
+        savedAt: new Date().toISOString()
       };
 
       // Merge checklist into parent session doc only (no separate checklist doc)
@@ -435,6 +475,8 @@ const BehaviorPlan = ({
 
       await setDoc(sessionDocRef, sessionUpdatePayload, { merge: true });
       setSavedSessionId(sessionIdToUse);
+      // mark savedChecklistId as owned by current user (set to sessionId or a checklist id if you produce one)
+      setSavedChecklistId(sessionIdToUse);
 
       console.log('[BehaviorPlan] parent session updated with checklist (no separate checklist doc):', sessionIdToUse);
 
