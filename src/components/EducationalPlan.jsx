@@ -484,7 +484,7 @@ const EducationalPlan = ({ currentChild, onSaveToLog, userSchoolId, teacherId })
       console.warn('handleGeneratePlan: error fetching assessment', e);
     }
 
-    const endpoint = 'http://localhost:3001/api/analyze';
+    const endpoint = 'https://tebyan-backend.vercel.app/api/analyze';
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 120000);
 
